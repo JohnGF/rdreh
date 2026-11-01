@@ -70,6 +70,9 @@ impl vt100::Callbacks for TermCallbacks {
 
 pub type Parser = vt100::Parser<TermCallbacks>;
 
+/// Interactive shells whose line editor clears the screen on Ctrl+L.
+const CLEARS_ON_CTRL_L: &[&str] = &["bash", "zsh", "fish", "nu", "elvish", "xonsh"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentState {
@@ -159,6 +162,7 @@ impl Pane {
         let last_output = Arc::new(AtomicU64::new(0));
 
         if spec.clear_on_start {
+            let shell_pid = child.process_id();
             let (parser, writer, typed, last_output) =
                 (parser.clone(), writer.clone(), typed.clone(), last_output.clone());
             std::thread::Builder::new().name(format!("pane-{id}-clear")).spawn(move || {
@@ -171,6 +175,14 @@ impl Pane {
                     }
                 }
                 if typed.load(Ordering::Acquire) {
+                    return;
+                }
+                // Only shells with line editing treat Ctrl+L as "clear". In
+                // dash or plain sh it would be typed into the next command.
+                let editing = shell_pid
+                    .and_then(procinfo::exe_name)
+                    .is_some_and(|n| CLEARS_ON_CTRL_L.contains(&n.as_str()));
+                if !editing {
                     return;
                 }
                 // Ctrl+L: every interactive shell clears and redraws its prompt;

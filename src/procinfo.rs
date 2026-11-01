@@ -15,6 +15,12 @@ pub fn ppid(pid: u32) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// File name of the program a process is running (`/proc/<pid>/exe`).
+pub fn exe_name(pid: u32) -> Option<String> {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    Some(exe.file_name()?.to_string_lossy().into_owned())
+}
+
 pub fn cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }

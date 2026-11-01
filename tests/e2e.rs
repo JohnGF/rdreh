@@ -99,11 +99,19 @@ impl Harness {
             std::fs::write(dir.path().join(name), sub(contents)).unwrap();
         }
         let config = config.replace("{dir}", &dir.path().display().to_string());
+        // Tests may pick their own shell; otherwise /bin/sh (dash on Debian/Ubuntu).
+        let shell = if config.contains("default_shell") { "" } else { "default_shell = \"/bin/sh\"\n" };
         std::fs::write(
             dir.path().join("config.toml"),
-            format!("[general]\ndefault_shell = \"/bin/sh\"\ntaskbar_badge = false\n{config}"),
+            format!("[general]\n{shell}taskbar_badge = false\n{config}"),
         )
         .unwrap();
+        for (name, _) in files {
+            if name.ends_with(".sh") || !name.contains('.') {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir.path().join(name), std::fs::Permissions::from_mode(0o755));
+            }
+        }
         let env: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), sub(v))).collect();
         let t = spawn_client(dir.path(), session, &env);
         let h = Harness {
@@ -434,7 +442,13 @@ const GREETING_ENV: &[(&str, &str)] = &[("ENV", "{dir}/greet.sh")];
 
 #[test]
 fn fresh_shells_start_cleared() {
-    let h = Harness::start_with("clear", BASIC, GREETING, GREETING_ENV);
+    // bash with a greeting rc file: has line editing, so Ctrl+L clears.
+    let files = [
+        ("greet.sh", "echo GREETING-XYZ\n"),
+        ("bash-greet", "#!/bin/sh\nexec bash --noprofile --rcfile {dir}/greet.sh \"$@\"\n"),
+    ];
+    let cfg = format!("default_shell = \"{{dir}}/bash-greet\"\n{BASIC}");
+    let h = Harness::start_with("clear", &cfg, &files, &[]);
     h.wait_until("greeting cleared and prompt redrawn", |h| {
         let t = h.screen_text();
         !t.contains("GREETING-XYZ") && t.contains("$ ")
@@ -894,4 +908,20 @@ fn a_degenerate_start_size_never_creates_1x1_panes() {
     let _ = server.wait();
     let dims: Vec<u16> = text.split_whitespace().map(|n| n.parse().unwrap()).collect();
     assert!(dims[0] >= 10 && dims[1] >= 40, "pane started at {dims:?}");
+}
+
+#[test]
+fn shells_without_line_editing_are_never_sent_ctrl_l() {
+    // Like dash: a shell with no line editor would type ^L into the next command.
+    let files = [(
+        "plainsh",
+        "#!/bin/sh\n[ -x {dir}/plain ] || cp \"$(command -v bash)\" {dir}/plain\nexec {dir}/plain --noediting --noprofile --norc \"$@\"\n",
+    )];
+    let cfg = "default_shell = \"{dir}/plainsh\"\n[workspaces.1]\nname = \"w\"\n";
+    let mut h = Harness::start_with("plain", cfg, &files, &[]);
+    std::thread::sleep(Duration::from_millis(1200)); // past the startup-clear window
+    h.send(b"echo plain-$((2+3))\r");
+    h.wait_screen("plain-5");
+    let text = h.screen_text();
+    assert!(!text.contains("not found") && !text.contains("^L"), "{text}");
 }
