@@ -10,7 +10,9 @@
 //!   timestamp, so usage is dated by the conversation file's mtime.
 //!
 //! Scanning is incremental: Claude files are read from their last offset, agy
-//! databases only when their mtime changes.
+//! databases only when their mtime changes. The scanner state is cached on
+//! disk (`$XDG_CACHE_HOME/rdr/tokens.json`), so a new `rdr tokens` only reads
+//! what changed since the last run instead of the whole history.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -19,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Usage {
     pub input: u64,
     pub output: u64,
@@ -300,14 +302,43 @@ fn open_ro(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
 
 // --------------------------------------------------------------- scanner
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct ClaudeFile {
+    /// Inode when last read: a replaced file is read again from the start.
+    ino: u64,
     offset: u64,
-    events: Vec<(i64, Usage)>,
+    /// (dedup key, timestamp ms, usage)
+    events: Vec<(String, i64, Usage)>,
+}
+
+/// Bump when the cached layout or the counting rules change.
+const CACHE_VERSION: u32 = 1;
+
+/// The scanner state persisted between runs.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    version: u32,
+    sources: [PathBuf; 3],
+    claude_files: HashMap<PathBuf, ClaudeFile>,
+    agy_files: HashMap<PathBuf, (i64, Usage)>,
+    opencode: HashMap<String, (i64, Usage)>,
+    opencode_updated: i64,
+    opencode_stamp: Option<[(u64, i64); 2]>,
+}
+
+pub fn default_cache_path() -> Option<PathBuf> {
+    match std::env::var_os("RDR_TOKENS_CACHE") {
+        Some(v) if v == "off" || v.is_empty() => None,
+        Some(v) => Some(PathBuf::from(v)),
+        None => dirs::cache_dir().map(|d| d.join("rdr/tokens.json")),
+    }
 }
 
 pub struct Scanner {
     paths: Paths,
+    cache: Option<PathBuf>,
+    /// State changed since the last save.
+    dirty: bool,
     claude_files: HashMap<PathBuf, ClaudeFile>,
     claude_seen: HashSet<String>,
     agy_files: HashMap<PathBuf, (i64, Usage)>,
@@ -323,6 +354,8 @@ impl Scanner {
     pub fn new(paths: Paths) -> Scanner {
         Scanner {
             paths,
+            cache: None,
+            dirty: false,
             claude_files: HashMap::new(),
             claude_seen: HashSet::new(),
             agy_files: HashMap::new(),
@@ -330,6 +363,63 @@ impl Scanner {
             opencode_updated: i64::MIN,
             opencode_stamp: None,
             errors: Vec::new(),
+        }
+    }
+
+    /// A scanner that starts from, and saves back to, the cache at `cache`.
+    /// A missing, unreadable or stale cache just means a full scan.
+    pub fn with_cache(paths: Paths, cache: Option<PathBuf>) -> Scanner {
+        let mut sc = Scanner::new(paths);
+        if let Some(path) = &cache
+            && let Ok(bytes) = std::fs::read(path)
+            && let Ok(snap) = serde_json::from_slice::<Snapshot>(&bytes)
+            && snap.version == CACHE_VERSION
+            && snap.sources == sc.sources()
+        {
+            sc.claude_seen = snap.claude_files.values().flat_map(|f| f.events.iter().map(|e| e.0.clone())).collect();
+            sc.claude_files = snap.claude_files;
+            sc.agy_files = snap.agy_files;
+            sc.opencode = snap.opencode;
+            sc.opencode_updated = snap.opencode_updated;
+            sc.opencode_stamp = snap.opencode_stamp;
+        }
+        sc.cache = cache;
+        sc
+    }
+
+    fn sources(&self) -> [PathBuf; 3] {
+        let p = &self.paths;
+        [p.claude_projects.clone(), p.opencode_db.clone(), p.agy_conversations.clone()]
+    }
+
+    /// Write the state to the cache (atomically) if it changed.
+    pub fn save(&mut self) {
+        let Some(path) = self.cache.clone() else { return };
+        if !self.dirty {
+            return;
+        }
+        let snap = Snapshot {
+            version: CACHE_VERSION,
+            sources: self.sources(),
+            claude_files: std::mem::take(&mut self.claude_files),
+            agy_files: std::mem::take(&mut self.agy_files),
+            opencode: std::mem::take(&mut self.opencode),
+            opencode_updated: self.opencode_updated,
+            opencode_stamp: self.opencode_stamp,
+        };
+        let res = (|| -> std::io::Result<()> {
+            let dir = path.parent().unwrap_or(Path::new("."));
+            std::fs::create_dir_all(dir)?;
+            let tmp = dir.join(format!(".tokens.{}.tmp", std::process::id()));
+            std::fs::write(&tmp, serde_json::to_vec(&snap)?)?;
+            std::fs::rename(&tmp, &path)
+        })();
+        self.claude_files = snap.claude_files;
+        self.agy_files = snap.agy_files;
+        self.opencode = snap.opencode;
+        match res {
+            Ok(()) => self.dirty = false,
+            Err(e) => self.errors.push(format!("cache {}: {e}", path.display())),
         }
     }
 
@@ -344,25 +434,39 @@ impl Scanner {
         }
         let t_oc = t.elapsed();
         self.scan_agy();
+        let t_agy = t.elapsed();
+        self.save();
         if timing {
             eprintln!(
-                "refresh: claude {:?} opencode {:?} agy {:?}",
+                "refresh: claude {:?} opencode {:?} agy {:?} save {:?}",
                 t_claude,
                 t_oc - t_claude,
-                t.elapsed() - t_oc
+                t_agy - t_oc,
+                t.elapsed() - t_agy
             );
         }
     }
 
     fn scan_claude(&mut self) {
+        use std::os::unix::fs::MetadataExt;
         let mut files = Vec::new();
         jsonl_files(&self.paths.claude_projects, &mut files);
-        for path in files {
-            let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let metas: Vec<_> = files.into_iter().filter_map(|p| std::fs::metadata(&p).ok().map(|m| (p, m))).collect();
+        // A message is counted once, in the first file read that holds it. If
+        // a file vanished or was replaced, its messages may live on in another
+        // file, so start Claude over rather than lose or double count them.
+        let live: HashMap<&PathBuf, &std::fs::Metadata> = metas.iter().map(|(p, m)| (p, m)).collect();
+        let stale = self.claude_files.iter().any(|(p, f)| {
+            live.get(p).is_none_or(|m| m.ino() != f.ino || m.len() < f.offset)
+        });
+        if stale {
+            self.claude_files.clear();
+            self.claude_seen.clear();
+            self.dirty = true;
+        }
+        for (path, meta) in metas {
             let entry = self.claude_files.entry(path.clone()).or_default();
-            if meta.len() < entry.offset {
-                *entry = ClaudeFile::default(); // truncated or rewritten
-            }
+            entry.ino = meta.ino();
             if meta.len() == entry.offset {
                 continue;
             }
@@ -379,12 +483,13 @@ impl Scanner {
             for line in buf[..end].split(|&c| c == b'\n') {
                 let Ok(line) = std::str::from_utf8(line) else { continue };
                 if let Some((key, ts, u)) = parse_claude_line(line)
-                    && self.claude_seen.insert(key)
+                    && self.claude_seen.insert(key.clone())
                 {
-                    entry.events.push((ts, u));
+                    entry.events.push((key, ts, u));
                 }
             }
             entry.offset += end as u64 + 1;
+            self.dirty = true;
         }
     }
 
@@ -395,7 +500,12 @@ impl Scanner {
         wal.push("-wal");
         let stamp = [stamp_of(db), stamp_of(Path::new(&wal))];
         if stamp[0].0 == 0 {
-            self.opencode.clear();
+            if !self.opencode.is_empty() || self.opencode_stamp.is_some() {
+                self.opencode.clear();
+                self.opencode_updated = i64::MIN;
+                self.opencode_stamp = None;
+                self.dirty = true;
+            }
             return Ok(());
         }
         if self.opencode_stamp == Some(stamp) {
@@ -429,6 +539,7 @@ impl Scanner {
             }
         }
         self.opencode_stamp = Some(stamp);
+        self.dirty = true;
         Ok(())
     }
 
@@ -449,11 +560,14 @@ impl Scanner {
             match Self::read_agy_db(&path) {
                 Ok(u) => {
                     self.agy_files.insert(path, (mtime, u));
+                    self.dirty = true;
                 }
                 Err(e) => self.errors.push(format!("agy {}: {e}", path.display())),
             }
         }
+        let before = self.agy_files.len();
         self.agy_files.retain(|p, _| live.contains(p));
+        self.dirty |= self.agy_files.len() != before;
     }
 
     fn read_agy_db(path: &Path) -> rusqlite::Result<Usage> {
@@ -475,7 +589,7 @@ impl Scanner {
         let mut per: HashMap<Tool, Usage> = TOOLS.iter().map(|t| (*t, Usage::default())).collect();
         let mut add = |tool: Tool, u: &Usage| per.get_mut(&tool).unwrap().add(u);
         for f in self.claude_files.values() {
-            for (ts, u) in &f.events {
+            for (_, ts, u) in &f.events {
                 if keep(*ts) {
                     add(Tool::Claude, u);
                 }
@@ -737,6 +851,73 @@ mod tests {
         // Windows filter by message timestamp.
         let since = parse_rfc3339_ms("2026-01-02T00:00:00Z");
         assert_eq!(sc.summary(since).into_iter().find(|(t, _)| *t == Tool::Claude).unwrap().1.input, 5);
+    }
+
+    #[test]
+    fn cache_resumes_and_matches_a_full_scan() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("projects/p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let cache = dir.path().join("cache/tokens.json");
+        let paths = || Paths {
+            claude_projects: dir.path().join("projects"),
+            opencode_db: dir.path().join("none.db"),
+            agy_conversations: dir.path().join("none"),
+        };
+        let claude = |sc: &Scanner| sc.summary(None).into_iter().find(|(t, _)| *t == Tool::Claude).unwrap().1;
+        let fresh = || {
+            let mut sc = Scanner::new(paths());
+            sc.refresh();
+            claude(&sc)
+        };
+        let cached = || {
+            let mut sc = Scanner::with_cache(paths(), Some(cache.clone()));
+            sc.refresh();
+            claude(&sc)
+        };
+
+        let a = proj.join("a.jsonl");
+        let b = proj.join("b.jsonl");
+        let mut fa = std::fs::File::create(&a).unwrap();
+        writeln!(fa, "{}", claude_json("m1", "2026-01-01T00:00:00Z", 10)).unwrap();
+        // A resumed session repeats m1 in a second file: counted once.
+        std::fs::write(&b, format!("{}\n{}\n", claude_json("m1", "2026-01-01T00:00:00Z", 10), claude_json("m2", "2026-01-01T00:00:00Z", 7))).unwrap();
+        assert_eq!(cached().input, 17);
+        assert!(cache.exists());
+
+        // The next run starts from the cache and only reads appended lines.
+        writeln!(fa, "{}", claude_json("m3", "2026-01-02T00:00:00Z", 100)).unwrap();
+        fa.flush().unwrap();
+        let mut sc = Scanner::with_cache(paths(), Some(cache.clone()));
+        assert_eq!(claude(&sc).input, 17, "state not restored from cache");
+        sc.refresh();
+        assert_eq!((claude(&sc).input, claude(&sc).calls), (117, 3));
+
+        // A replaced file (new inode, same or larger size) is read again.
+        let tmp = proj.join("a.new");
+        std::fs::write(&tmp, format!("{}\n{}\n", claude_json("m1", "2026-01-01T00:00:00Z", 10), claude_json("m4", "2026-01-03T00:00:00Z", 1000))).unwrap();
+        std::fs::rename(&tmp, &a).unwrap();
+        assert_eq!(cached(), fresh());
+        assert_eq!(cached().input, 1017);
+
+        // A deleted file: m1 still lives in b and must stay counted once.
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(cached(), fresh());
+        assert_eq!(cached().input, 17);
+
+        // A cache made for other source paths is ignored.
+        let mut other = Scanner::with_cache(
+            Paths { claude_projects: dir.path().join("elsewhere"), ..paths() },
+            Some(cache.clone()),
+        );
+        assert_eq!(claude(&other).calls, 0);
+        other.refresh();
+        assert_eq!(claude(&other).calls, 0);
+
+        // A corrupt cache is a full scan, not an error.
+        std::fs::write(&cache, b"{not json").unwrap();
+        assert_eq!(cached(), fresh());
     }
 
     #[test]

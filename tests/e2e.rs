@@ -487,6 +487,8 @@ fn startup_clear_never_interrupts_typing() {
 fn run(args: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> Output {
     let mut c = Command::new(BIN);
     c.args(args).env_remove("RDR_SOCKET").env_remove("RDR_PANE").env_remove("RDR_SESSION");
+    // Never touch the real token cache; tests that want one pass a path.
+    c.env("RDR_TOKENS_CACHE", "off");
     for (k, v) in env {
         c.env(k, v);
     }

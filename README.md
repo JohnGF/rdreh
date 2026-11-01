@@ -98,8 +98,12 @@ cache read, cache write). The numbers come from each tool's own local records:
 | OpenCode | `$XDG_DATA_HOME/opencode/opencode.db` |
 | agy (Antigravity CLI) | `~/.gemini/antigravity-cli/conversations/*.db`. *Unofficial:* usage is decoded from protobuf metadata and dated by the conversation file's modification time. |
 
-The first scan reads the whole history. After that, refreshes are incremental:
-only new transcript bytes and changed databases are read.
+Only the first scan ever reads the whole history. The scanner's state is cached
+in `~/.cache/rdr/tokens.json`, so every later run (and every refresh of
+`--watch`) reads only new transcript bytes and changed databases: about 15 ms
+instead of a second on a large history. If a transcript is deleted or replaced,
+Claude usage is recounted from scratch, so totals always match a fresh scan.
+Set `RDR_TOKENS_CACHE=off` to skip the cache, or to a path to move it.
 
 ### Sessions
 

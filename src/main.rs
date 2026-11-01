@@ -355,7 +355,7 @@ fn swarm_line(cli: &Cli, cfg: &Config) -> Option<String> {
 }
 
 fn run_tokens(cli: &Cli, cfg: &Config, watch: bool, interval: u64, json: bool) -> Result<()> {
-    let mut scanner = tokens::Scanner::new(tokens::Paths::detect());
+    let mut scanner = tokens::Scanner::with_cache(tokens::Paths::detect(), tokens::default_cache_path());
     if watch {
         // The first scan reads every transcript (seconds on a large history).
         print!("\x1b[?25l\x1b[H\x1b[2J \x1b[1;36mrdreh · tokens\x1b[0m  \x1b[2mscanning agent history…\x1b[0m");
