@@ -253,13 +253,14 @@ tracked = false
 /// process name; `exec -a sleep` keeps argv[0] = "sleep", so multi-call
 /// coreutils (which dispatch on argv[0]) still behave as sleep.
 fn fake_agent_cmd(dir: &Path, secs: u32) -> String {
-    let link = dir.join("claude");
-    if !link.exists() {
-        let out = Command::new("sh").args(["-c", "command -v sleep"]).output().unwrap();
-        let sleep = std::fs::canonicalize(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
-        std::os::unix::fs::symlink(sleep, &link).unwrap();
+    // A script named `claude`: its process name is the file name, on any
+    // distro (multi-call coreutils reject a renamed or relinked `sleep`).
+    let script = dir.join("claude");
+    if !script.exists() {
+        std::fs::write(&script, "#!/bin/sh\nsleep \"$1\"\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     }
-    format!("bash -c 'exec -a sleep {} {secs}'\r", link.display())
+    format!("{} {secs}\r", script.display())
 }
 
 #[test]
@@ -436,7 +437,7 @@ fn kill_shuts_down_cleanly() {
     }
     assert!(h.exited(), "rdr did not exit");
     assert!(!Path::new(&format!("/proc/{pid}")).exists(), "pane shell survived");
-    // The agent's command line is exactly "sleep 3017" (argv[0] set by exec -a).
+    // The agent script's child runs exactly "sleep 3017".
     let survivors = Command::new("pgrep").args(["-fx", "sleep 3017"]).output().unwrap();
     assert!(survivors.stdout.is_empty(), "agent process survived shutdown");
 }
