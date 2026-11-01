@@ -18,6 +18,8 @@ two share the agent hook (`swarm-agent-state`), but nothing else.
 - **Agent tracking.** Hooks call `rdr state working|idle`. The status bar shows `Finished: n/m`, finished panes are flagged until you look at them, the terminal title follows the counts, and a KDE/Unity taskbar badge is sent natively over D-Bus.
 - **Config-driven.** Everything lives in `~/.config/rdr/config.toml` (`rdr default-config` prints an example).
 
+Website: https://johngf.github.io/rdreh/
+
 ## Install
 
 ```sh
@@ -178,17 +180,26 @@ version-number process title (`2.1.x`) also counts. Shell panes never count.
 | Alt+\` | cycle panes |
 | Alt+l | cycle layout: single, dual, tri, quad |
 | Alt+z | zoom the focused pane |
+| Alt+v | copy / view mode (scroll, visual select, yank to clipboard) |
 | Alt+= or Alt+r | reset the layout (unzoom) |
 | Alt+t / Alt+f / Alt+n | track this workspace / finish scope / notifications |
 | Shift+PgUp/PgDn, mouse wheel | scrollback |
 | Shift+Enter | sends Meta+Enter (newline in agent prompts) |
+| Mouse drag | select and copy text to clipboard inside pane |
+| Ctrl+Shift+V | terminal paste. Files copied in a file manager arrive as escaped paths on one line, not `file://` lines (Konsole, kitty, WezTerm) |
 | Ctrl+b h | help overlay |
+| Ctrl+b [ or v | enter copy / view mode |
+| Ctrl+b p | paste the clipboard from rdr itself; copied files become escaped paths. Use it in terminals that paste nothing for copied files (Alacritty) |
 | Ctrl+b d | detach (everything keeps running; `rdr` reattaches) |
 | Ctrl+b c / a / n / x / & / , / q | new workspace / add project / add pane / close pane / close workspace / rename / quit |
 | Ctrl+b Ctrl+b | send a literal Ctrl+b |
 
-The mouse is captured, so use Shift+drag for your terminal's native text
-selection.
+Inside **Copy mode** (`Alt+v` or `Ctrl+b [`):
+* `hjkl` or arrows move the cursor; `Ctrl+u`/`Ctrl+d` or `PgUp`/`PgDn` jump half pages; `g`/`G` jump to top/bottom; `0`/`$` jump to start/end of line.
+* `v` starts character selection; `V` starts line selection; `Space` starts selection.
+* `y` or `Enter` copies selected text to system clipboard (via OSC 52 and `wl-copy`/`xclip`) and exits copy mode.
+* `q` or `Esc` cancels copy mode.
+* In shells, clicking and dragging with the mouse within a pane also selects and automatically copies to the clipboard upon release.
 
 ## Platforms
 

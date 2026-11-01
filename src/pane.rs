@@ -311,6 +311,84 @@ impl Pane {
     pub fn reap(&mut self) {
         let _ = self.child.try_wait();
     }
+
+    /// Extracts text from the terminal buffer between two absolute row coordinates.
+    pub fn extract_text(
+        &self,
+        start_abs_row: usize,
+        start_col: u16,
+        end_abs_row: usize,
+        end_col: u16,
+    ) -> String {
+        let mut p = self.parser.lock().unwrap();
+        extract_screen_text(p.screen_mut(), start_abs_row, start_col, end_abs_row, end_col)
+    }
+}
+
+/// Extracts text from a vt100 screen buffer between two absolute row coordinates.
+pub fn extract_screen_text(
+    screen: &mut vt100::Screen,
+    start_abs_row: usize,
+    start_col: u16,
+    end_abs_row: usize,
+    end_col: u16,
+) -> String {
+    let (sr, sc, er, ec) = if start_abs_row < end_abs_row
+        || (start_abs_row == end_abs_row && start_col <= end_col)
+    {
+        (start_abs_row, start_col, end_abs_row, end_col)
+    } else {
+        (end_abs_row, end_col, start_abs_row, start_col)
+    };
+
+    let saved_sb = screen.scrollback();
+    let total_history = screen.scrollback_len();
+    let (rows, cols) = {
+        let (r, c) = screen.size();
+        (r.get(), c.get())
+    };
+
+    let mut result = String::new();
+    for r_abs in sr..=er {
+        let (vis_row, sb_needed) = if r_abs < total_history {
+            (0, total_history - r_abs)
+        } else {
+            (r_abs - total_history, 0)
+        };
+        if vis_row >= rows as usize {
+            break;
+        }
+        screen.set_scrollback(sb_needed);
+        let vis_row_u16 = vis_row as u16;
+
+        let col_from = if r_abs == sr { sc } else { 0 };
+        let col_to = if r_abs == er { ec } else { cols.saturating_sub(1) };
+
+        let mut line = String::new();
+        for c in col_from..=col_to {
+            if let Some(cell) = screen.cell(vis_row_u16, c)
+                && !cell.is_wide_continuation()
+            {
+                let contents = cell.contents();
+                line.push_str(if contents.is_empty() { " " } else { contents });
+            }
+        }
+
+        let wrapped = screen.row_wrapped(vis_row_u16);
+        if r_abs < er {
+            let trimmed = line.trim_end();
+            result.push_str(trimmed);
+            if !wrapped {
+                result.push('\n');
+            }
+        } else {
+            let trimmed = line.trim_end();
+            result.push_str(trimmed);
+        }
+    }
+
+    screen.set_scrollback(saved_sb);
+    result
 }
 
 impl Drop for Pane {
@@ -334,5 +412,27 @@ mod tests {
         assert_eq!(r, "\x1b[1;6R\x1b[?62;22c");
         p.process(b"\x1b]2;my title\x07");
         assert_eq!(p.callbacks().title.as_deref(), Some("my title"));
+    }
+
+    #[test]
+    fn extracts_screen_text_single_and_multi_line() {
+        let mut p = Parser::new_with_callbacks(nz(24), nz(80), 100, TermCallbacks::default());
+        p.process(b"hello world\r\nline two\r\nline three");
+        let screen = p.screen_mut();
+        assert_eq!(extract_screen_text(screen, 0, 0, 0, 4), "hello");
+        assert_eq!(extract_screen_text(screen, 0, 6, 0, 10), "world");
+        assert_eq!(extract_screen_text(screen, 0, 0, 1, 3), "hello world\nline");
+    }
+
+    #[test]
+    fn extracts_screen_text_with_scrollback() {
+        let mut p = Parser::new_with_callbacks(nz(5), nz(80), 100, TermCallbacks::default());
+        for i in 1..=10 {
+            p.process(format!("line {i}\r\n").as_bytes());
+        }
+        let screen = p.screen_mut();
+        assert!(screen.scrollback_len() >= 5);
+        let first = extract_screen_text(screen, 0, 0, 0, 80);
+        assert_eq!(first, "line 1");
     }
 }

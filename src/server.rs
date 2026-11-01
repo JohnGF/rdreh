@@ -163,6 +163,10 @@ impl Client {
             let _ = queue!(backend.buf(), SetTitle(&title));
             self.last_title = title;
         }
+        for payload in app.pending_clipboard.drain(..) {
+            use std::io::Write;
+            let _ = backend.buf().write_all(&payload);
+        }
         let bytes = backend.take();
         bytes.is_empty() || self.out.send(bytes).is_ok()
     }

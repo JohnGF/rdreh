@@ -1,5 +1,6 @@
 mod app;
 mod client;
+mod clipboard;
 mod config;
 mod desktop;
 mod install;
@@ -8,6 +9,7 @@ mod keys;
 mod launcher;
 mod layout;
 mod pane;
+mod paste;
 mod procinfo;
 mod server;
 mod tokens;

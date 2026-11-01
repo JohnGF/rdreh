@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -69,12 +69,23 @@ pub enum ConfirmKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyState {
+    pub pane_id: PaneId,
+    pub cursor_abs_row: usize,
+    pub cursor_col: u16,
+    pub selection_anchor: Option<(usize, u16)>,
+    pub line_wise: bool,
+    pub mouse_dragging: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Prefix,
     Help,
     Prompt { kind: PromptKind, input: String },
     Confirm(ConfirmKind),
+    Copy(CopyState),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -102,6 +113,8 @@ pub struct App {
     /// Hit-testing data from the last draw.
     pub visible: Vec<(PaneId, Rect)>,
     pub tab_hits: Vec<(u8, Rect)>,
+    pub pending_clipboard: Vec<Vec<u8>>,
+    mouse_down_pos: Option<(PaneId, u16, u16)>,
     commands: HashMap<PaneId, String>,
     next_id: PaneId,
     term_size: (u16, u16),
@@ -149,6 +162,8 @@ impl App {
             dirty: Arc::new(AtomicBool::new(false)),
             visible: Vec::new(),
             tab_hits: Vec::new(),
+            pending_clipboard: Vec::new(),
+            mouse_down_pos: None,
             commands: HashMap::new(),
             next_id: 1,
             term_size,
@@ -682,6 +697,8 @@ impl App {
     }
 
     fn paste(&mut self, text: &str) {
+        let files = crate::paste::file_list(text);
+        let text = files.as_deref().unwrap_or(text);
         if let Mode::Prompt { input, .. } = &mut self.mode {
             input.push_str(text.lines().next().unwrap_or(""));
             return;
@@ -710,6 +727,7 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) {
         match self.mode.clone() {
             Mode::Normal => self.normal_key(key),
+            Mode::Copy(state) => self.handle_copy_key(key, state),
             Mode::Prefix => {
                 self.mode = Mode::Normal;
                 self.prefix_key(key);
@@ -760,6 +778,7 @@ impl App {
                 '`' => self.cycle_pane(),
                 'l' => self.cycle_layout(),
                 'z' => self.toggle_zoom(),
+                'v' => self.enter_copy_mode(),
                 '=' | 'r' => self.reset_layout(),
                 't' => self.toggle_tracked(),
                 'f' => self.toggle_scope(),
@@ -774,6 +793,12 @@ impl App {
         match key.code {
             KeyCode::Char('b') => self.forward_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
             KeyCode::Char('h' | '?') => self.mode = Mode::Help,
+            KeyCode::Char('[' | 'v') => self.enter_copy_mode(),
+            KeyCode::Char('p') => {
+                if let Some(text) = crate::clipboard::read_clipboard() {
+                    self.paste(&text);
+                }
+            }
             KeyCode::Char('c') => {
                 let cwd = self.focused_cwd();
                 self.add_project(&cwd, Some(Layout::Single));
@@ -800,6 +825,227 @@ impl App {
             KeyCode::Right => self.focus_dir(Dir::Right),
             KeyCode::Up => self.focus_dir(Dir::Up),
             KeyCode::Down => self.focus_dir(Dir::Down),
+            _ => {}
+        }
+    }
+
+    pub fn enter_copy_mode(&mut self) {
+        let (pane_id, cursor_abs_row, cursor_col) = {
+            let Some(pane) = self.focused_pane() else { return };
+            let pane_id = pane.id;
+            let parser = pane.parser.lock().unwrap();
+            let screen = parser.screen();
+            let total_history = screen.scrollback_len();
+            let sb = screen.scrollback();
+            let (rows, cols) = {
+                let (r, c) = screen.size();
+                (r.get(), c.get())
+            };
+            let top_abs = total_history.saturating_sub(sb);
+            let (cur_row, cur_col) = screen.cursor_position();
+            let (cursor_abs_row, cursor_col) = if cur_row < rows && cur_col < cols {
+                (top_abs + cur_row as usize, cur_col)
+            } else {
+                (top_abs + rows.saturating_sub(1) as usize, 0)
+            };
+            (pane_id, cursor_abs_row, cursor_col)
+        };
+
+        self.mode = Mode::Copy(CopyState {
+            pane_id,
+            cursor_abs_row,
+            cursor_col,
+            selection_anchor: None,
+            line_wise: false,
+            mouse_dragging: false,
+        });
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    pub fn exit_copy_mode(&mut self) {
+        if let Mode::Copy(state) = &self.mode
+            && let Some(pane) = self.panes.get(&state.pane_id)
+        {
+            pane.reset_scroll();
+        }
+        self.mode = Mode::Normal;
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    pub fn copy_selection(&mut self) {
+        let Mode::Copy(state) = &self.mode else { return };
+        let pane_id = state.pane_id;
+        let Some(pane) = self.panes.get(&pane_id) else {
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        let cols = {
+            let p = pane.parser.lock().unwrap();
+            p.screen().size().1.get()
+        };
+
+        let (start_abs, start_col, end_abs, end_col) = match state.selection_anchor {
+            Some((a_row, a_col)) => {
+                let (sr, sc, er, ec) = if a_row < state.cursor_abs_row
+                    || (a_row == state.cursor_abs_row && a_col <= state.cursor_col)
+                {
+                    (a_row, a_col, state.cursor_abs_row, state.cursor_col)
+                } else {
+                    (state.cursor_abs_row, state.cursor_col, a_row, a_col)
+                };
+                if state.line_wise {
+                    (sr, 0, er, cols.saturating_sub(1))
+                } else {
+                    (sr, sc, er, ec)
+                }
+            }
+            None => (state.cursor_abs_row, 0, state.cursor_abs_row, cols.saturating_sub(1)),
+        };
+
+        let text = pane.extract_text(start_abs, start_col, end_abs, end_col);
+        pane.reset_scroll();
+        if !text.is_empty() {
+            let lines = text.lines().count().max(1);
+            let chars = text.chars().count();
+            let osc52 = crate::clipboard::copy_to_clipboard(&text);
+            self.pending_clipboard.push(osc52);
+            self.flash(format!("Copied {chars} chars ({lines} lines) to clipboard"));
+        }
+        self.mode = Mode::Normal;
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn copy_move_cursor(&mut self, mut state: CopyState, delta_row: isize, delta_col: isize) {
+        let Some(pane) = self.panes.get(&state.pane_id) else { return };
+        let mut p = pane.parser.lock().unwrap();
+        let screen = p.screen_mut();
+        let total_history = screen.scrollback_len();
+        let (rows, cols) = {
+            let (r, c) = screen.size();
+            (r.get(), c.get())
+        };
+        let total_rows = total_history + rows as usize;
+        if total_rows == 0 {
+            return;
+        }
+
+        let cur_abs = state.cursor_abs_row as isize + delta_row;
+        let new_abs = cur_abs.clamp(0, (total_rows - 1) as isize) as usize;
+        let cur_col = state.cursor_col as isize + delta_col;
+        let new_col = cur_col.clamp(0, (cols.saturating_sub(1)) as isize) as u16;
+
+        state.cursor_abs_row = new_abs;
+        state.cursor_col = new_col;
+
+        let mut cur_sb = screen.scrollback();
+        let top_abs = total_history.saturating_sub(cur_sb);
+        let bottom_abs = top_abs + (rows as usize).saturating_sub(1);
+
+        if new_abs < top_abs {
+            cur_sb = total_history.saturating_sub(new_abs);
+            screen.set_scrollback(cur_sb);
+        } else if new_abs > bottom_abs {
+            let top_needed = new_abs.saturating_sub((rows as usize).saturating_sub(1));
+            cur_sb = total_history.saturating_sub(top_needed);
+            screen.set_scrollback(cur_sb);
+        }
+
+        self.mode = Mode::Copy(state);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn handle_copy_key(&mut self, key: KeyEvent, mut state: CopyState) {
+        let m = key.modifiers;
+        let ctrl = m.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.exit_copy_mode(),
+            KeyCode::Char('c') if ctrl => self.exit_copy_mode(),
+            KeyCode::Char('v') => {
+                if state.selection_anchor.is_some() && !state.line_wise {
+                    state.selection_anchor = None;
+                } else {
+                    state.selection_anchor = Some((state.cursor_abs_row, state.cursor_col));
+                    state.line_wise = false;
+                }
+                self.mode = Mode::Copy(state);
+                self.dirty.store(true, Ordering::Release);
+            }
+            KeyCode::Char('V') => {
+                if state.selection_anchor.is_some() && state.line_wise {
+                    state.selection_anchor = None;
+                } else {
+                    state.selection_anchor = Some((state.cursor_abs_row, 0));
+                    state.line_wise = true;
+                }
+                self.mode = Mode::Copy(state);
+                self.dirty.store(true, Ordering::Release);
+            }
+            KeyCode::Char(' ') => {
+                if state.selection_anchor.is_none() {
+                    state.selection_anchor = Some((state.cursor_abs_row, state.cursor_col));
+                    state.line_wise = false;
+                    self.mode = Mode::Copy(state);
+                    self.dirty.store(true, Ordering::Release);
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Enter => self.copy_selection(),
+            KeyCode::Up | KeyCode::Char('k') => self.copy_move_cursor(state, -1, 0),
+            KeyCode::Down | KeyCode::Char('j') => self.copy_move_cursor(state, 1, 0),
+            KeyCode::Left | KeyCode::Char('h') => self.copy_move_cursor(state, 0, -1),
+            KeyCode::Right | KeyCode::Char('l') => self.copy_move_cursor(state, 0, 1),
+            KeyCode::Home | KeyCode::Char('0') | KeyCode::Char('^') => {
+                state.cursor_col = 0;
+                self.mode = Mode::Copy(state);
+                self.dirty.store(true, Ordering::Release);
+            }
+            KeyCode::End | KeyCode::Char('$') => {
+                if let Some(pane) = self.panes.get(&state.pane_id) {
+                    let cols = pane.parser.lock().unwrap().screen().size().1.get();
+                    state.cursor_col = cols.saturating_sub(1);
+                    self.mode = Mode::Copy(state);
+                    self.dirty.store(true, Ordering::Release);
+                }
+            }
+            KeyCode::PageUp | KeyCode::Char('u' | 'b') if ctrl => {
+                if let Some(pane) = self.panes.get(&state.pane_id) {
+                    let rows = pane.parser.lock().unwrap().screen().size().0.get();
+                    let step = (rows as isize / 2).max(1);
+                    self.copy_move_cursor(state, -step, 0);
+                }
+            }
+            KeyCode::PageDown | KeyCode::Char('d' | 'f') if ctrl => {
+                if let Some(pane) = self.panes.get(&state.pane_id) {
+                    let rows = pane.parser.lock().unwrap().screen().size().0.get();
+                    let step = (rows as isize / 2).max(1);
+                    self.copy_move_cursor(state, step, 0);
+                }
+            }
+            KeyCode::Char('g') => {
+                if let Some(pane) = self.panes.get(&state.pane_id) {
+                    let mut p = pane.parser.lock().unwrap();
+                    let screen = p.screen_mut();
+                    let total_history = screen.scrollback_len();
+                    screen.set_scrollback(total_history);
+                    state.cursor_abs_row = 0;
+                    state.cursor_col = 0;
+                    self.mode = Mode::Copy(state);
+                    self.dirty.store(true, Ordering::Release);
+                }
+            }
+            KeyCode::Char('G') => {
+                if let Some(pane) = self.panes.get(&state.pane_id) {
+                    let mut p = pane.parser.lock().unwrap();
+                    let screen = p.screen_mut();
+                    let total_history = screen.scrollback_len();
+                    let rows = screen.size().0.get() as usize;
+                    screen.set_scrollback(0);
+                    state.cursor_abs_row = (total_history + rows).saturating_sub(1);
+                    self.mode = Mode::Copy(state);
+                    self.dirty.store(true, Ordering::Release);
+                }
+            }
             _ => {}
         }
     }
@@ -831,15 +1077,95 @@ impl App {
 
     fn handle_mouse(&mut self, m: MouseEvent) {
         let pos = Position::new(m.column, m.row);
-        if let MouseEventKind::Down(MouseButton::Left) = m.kind
-            && let Some((index, _)) = self.tab_hits.iter().find(|(_, r)| r.contains(pos))
-        {
-            self.switch_workspace(*index);
+        let tab_hit = if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            self.tab_hits.iter().find(|(_, r)| r.contains(pos)).map(|(idx, _)| *idx)
+        } else {
+            None
+        };
+        if let Some(index) = tab_hit {
+            if matches!(self.mode, Mode::Copy(_)) {
+                self.exit_copy_mode();
+            }
+            self.switch_workspace(index);
             return;
         }
+
         let Some((id, rect)) = self.visible.iter().find(|(_, r)| r.contains(pos)).copied() else {
+            if matches!(self.mode, Mode::Copy(_)) && matches!(m.kind, MouseEventKind::Down(_)) {
+                self.exit_copy_mode();
+            }
             return;
         };
+
+        let inner_rect = inner(rect);
+        let in_inner = inner_rect.contains(pos);
+        let (col, row) = if in_inner {
+            (m.column - inner_rect.x, m.row - inner_rect.y)
+        } else {
+            (0, 0)
+        };
+
+        if let Mode::Copy(mut state) = self.mode.clone() {
+            if state.pane_id == id && in_inner {
+                let Some(p) = self.panes.get(&id) else { return };
+                let (total_history, sb) = {
+                    let parser = p.parser.lock().unwrap();
+                    let s = parser.screen();
+                    (s.scrollback_len(), s.scrollback())
+                };
+                let top_abs = total_history.saturating_sub(sb);
+                let abs_row = top_abs + row as usize;
+
+                match m.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        state.cursor_abs_row = abs_row;
+                        state.cursor_col = col;
+                        state.selection_anchor = Some((abs_row, col));
+                        state.line_wise = false;
+                        state.mouse_dragging = true;
+                        self.mode = Mode::Copy(state);
+                        self.dirty.store(true, Ordering::Release);
+                        return;
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        state.cursor_abs_row = abs_row;
+                        state.cursor_col = col;
+                        self.mode = Mode::Copy(state);
+                        self.dirty.store(true, Ordering::Release);
+                        return;
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if state.mouse_dragging {
+                            state.mouse_dragging = false;
+                            if let Some((a_row, a_col)) = state.selection_anchor
+                                && (a_row != abs_row || a_col != col)
+                            {
+                                state.cursor_abs_row = abs_row;
+                                state.cursor_col = col;
+                                self.mode = Mode::Copy(state);
+                                self.copy_selection();
+                                return;
+                            }
+                            self.mode = Mode::Copy(state);
+                            self.dirty.store(true, Ordering::Release);
+                        }
+                        return;
+                    }
+                    MouseEventKind::ScrollUp => {
+                        self.copy_move_cursor(state, -3, 0);
+                        return;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.copy_move_cursor(state, 3, 0);
+                        return;
+                    }
+                    _ => {}
+                }
+            } else if matches!(m.kind, MouseEventKind::Down(_)) {
+                self.exit_copy_mode();
+            }
+        }
+
         if let MouseEventKind::Down(_) = m.kind
             && let Some(ws) = self.ws_mut()
             && let Some(i) = ws.panes.iter().position(|p| *p == id)
@@ -849,33 +1175,74 @@ impl App {
             self.on_focus_changed();
             return; // focusing click is not forwarded
         }
+
         let Some(p) = self.panes.get(&id) else { return };
-        let inner = inner(rect);
         let (mode, enc, alt_screen) = {
             let parser = p.parser.lock().unwrap();
             let s = parser.screen();
             (s.mouse_protocol_mode(), s.mouse_protocol_encoding(), s.alternate_screen())
         };
+
         if mode != vt100::MouseProtocolMode::None {
-            if inner.contains(pos) {
-                let (col, row) = (m.column - inner.x, m.row - inner.y);
-                if let Some(bytes) = keys::encode_mouse(&m, col, row, mode, enc) {
-                    p.write(&bytes);
-                }
+            if in_inner
+                && let Some(bytes) = keys::encode_mouse(&m, col, row, mode, enc)
+            {
+                p.write(&bytes);
             }
             return;
         }
-        let up = match m.kind {
-            MouseEventKind::ScrollUp => true,
-            MouseEventKind::ScrollDown => false,
-            _ => return,
-        };
-        if alt_screen {
-            // Alternate-scroll: wheel becomes arrow keys (less, man, git log).
-            let seq: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
-            p.write(&seq.repeat(3));
-        } else {
-            p.scroll(if up { 3 } else { -3 });
+
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if in_inner {
+                    self.mouse_down_pos = Some((id, m.column, m.row));
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if in_inner
+                    && let Some((down_id, down_x, down_y)) = self.mouse_down_pos
+                    && down_id == id
+                    && (m.column != down_x || m.row != down_y)
+                {
+                    let parser = p.parser.lock().unwrap();
+                    let s = parser.screen();
+                    let total_history = s.scrollback_len();
+                    let sb = s.scrollback();
+                    let top_abs = total_history.saturating_sub(sb);
+                    let start_col = down_x.saturating_sub(inner_rect.x);
+                    let start_row = down_y.saturating_sub(inner_rect.y);
+                    let anchor_abs = top_abs + start_row as usize;
+                    let cur_abs = top_abs + row as usize;
+                    self.mode = Mode::Copy(CopyState {
+                        pane_id: id,
+                        cursor_abs_row: cur_abs,
+                        cursor_col: col,
+                        selection_anchor: Some((anchor_abs, start_col)),
+                        line_wise: false,
+                        mouse_dragging: true,
+                    });
+                    self.mouse_down_pos = None;
+                    self.dirty.store(true, Ordering::Release);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.mouse_down_pos = None;
+            }
+            MouseEventKind::ScrollUp => {
+                if alt_screen {
+                    p.write(b"\x1b[A\x1b[A\x1b[A");
+                } else {
+                    p.scroll(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if alt_screen {
+                    p.write(b"\x1b[B\x1b[B\x1b[B");
+                } else {
+                    p.scroll(-3);
+                }
+            }
+            _ => {}
         }
     }
 

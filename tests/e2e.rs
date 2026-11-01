@@ -950,3 +950,27 @@ fn shells_without_line_editing_are_never_sent_ctrl_l() {
     let text = h.screen_text();
     assert!(!text.contains("not found") && !text.contains("^L"), "{text}");
 }
+
+#[test]
+fn copy_mode_navigation_selection_and_yank() {
+    let mut h = Harness::start("copymode", BASIC);
+    h.send(b"echo COPY_TEST_STRING_XYZ\r");
+    h.wait_screen("COPY_TEST_STRING_XYZ");
+
+    // Enter copy mode with Alt+v
+    h.send(b"\x1bv");
+    h.wait_screen("[COPY");
+
+    // Move up to the output line, start selection, and yank
+    h.send(b"k");
+    h.send(b"v");
+    h.wait_screen("[SELECT]");
+    h.send(b"y");
+    h.wait_screen("Copied");
+
+    // Also test entering copy mode via Ctrl+b [ and exiting with q
+    h.send(b"\x02[");
+    h.wait_screen("[COPY");
+    h.send(b"q");
+    h.wait_until("exit copy mode", |h| !h.screen_text().contains("[COPY"));
+}

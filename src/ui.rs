@@ -21,21 +21,23 @@ pub const HELP: &str = "\
    Alt+`             cycle panes
    Alt+l             cycle layout: single > dual > tri > quad
    Alt+z             zoom focused pane
+   Alt+v             copy / view mode (scroll, select, yank)
    Alt+= / Alt+r     reset layout (unzoom)
    Alt+t             include/exclude workspace from agent math
    Alt+f             finish scope: all workspaces / agents only
    Alt+n             desktop notifications on/off
    Shift+PgUp/PgDn   scrollback (any key returns to live)
    Shift+Enter       newline in agent prompts (sends Meta+Enter)
-   Mouse             click to focus, wheel to scroll
+   Mouse             click to focus, drag to copy, wheel to scroll
 
  Ctrl+b, then
    h ?               this help          a   add project folder
    c                 new workspace      n % | \" -   add pane
    x                 close pane         &   close workspace
-   ,                 rename workspace   z   zoom
+   [ v               copy / view mode   ,   rename workspace
    Space             cycle layout       =   reset layout
    0..9              workspace          d   detach (keeps running)
+   p                 paste clipboard (copied files become paths)
    q                 quit rdreh (ends every pane)
    Ctrl+b            send a literal Ctrl+b to the pane
 
@@ -59,8 +61,19 @@ fn vt_color(c: vt100::Color) -> Color {
     }
 }
 
-fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer) {
+#[derive(Clone, Copy)]
+pub struct SelectionRange {
+    pub start_abs_row: usize,
+    pub start_col: u16,
+    pub end_abs_row: usize,
+    pub end_col: u16,
+}
+
+fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer, selection: Option<SelectionRange>) {
+    let total_history = screen.scrollback_len();
+    let top_abs = total_history.saturating_sub(screen.scrollback());
     for row in 0..area.height {
+        let abs_row = top_abs + row as usize;
         for col in 0..area.width {
             let Some(cell) = screen.cell(row, col) else { continue };
             if cell.is_wide_continuation() {
@@ -83,6 +96,22 @@ fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer) {
             if cell.inverse() {
                 mods |= Modifier::REVERSED;
             }
+
+            if let Some(sel) = selection {
+                let is_selected = if sel.start_abs_row == sel.end_abs_row {
+                    abs_row == sel.start_abs_row && col >= sel.start_col && col <= sel.end_col
+                } else if abs_row == sel.start_abs_row {
+                    col >= sel.start_col
+                } else if abs_row == sel.end_abs_row {
+                    col <= sel.end_col
+                } else {
+                    abs_row > sel.start_abs_row && abs_row < sel.end_abs_row
+                };
+                if is_selected {
+                    mods |= Modifier::REVERSED;
+                }
+            }
+
             let contents = cell.contents();
             out.set_symbol(if contents.is_empty() { " " } else { contents });
             out.set_style(
@@ -126,8 +155,15 @@ pub fn draw(f: &mut Frame, app: &mut App) -> Option<vt100::CursorStyle> {
         let border = if is_focused { theme.active } else { theme.inactive };
 
         let mut title = vec![Span::raw(format!(" {} {} ", n + 1, pane_label(app, pane)))];
+        let copy_state = match &app.mode {
+            Mode::Copy(s) if s.pane_id == *id => Some(s),
+            _ => None,
+        };
         let parser = pane.parser.lock().unwrap();
         let screen = parser.screen();
+        if copy_state.is_some() {
+            title.push(Span::styled("[COPY] ", Style::new().fg(theme.working).add_modifier(Modifier::BOLD)));
+        }
         if screen.scrollback() > 0 {
             title.push(Span::styled(format!("[↑{}] ", screen.scrollback()), Style::new().fg(theme.working)));
         }
@@ -153,13 +189,42 @@ pub fn draw(f: &mut Frame, app: &mut App) -> Option<vt100::CursorStyle> {
         }
         f.render_widget(block, *rect);
         let inner_rect = inner(*rect);
-        render_screen(screen, inner_rect, f.buffer_mut());
 
-        if is_focused && app.mode == Mode::Normal && screen.scrollback() == 0 && !screen.hide_cursor() {
-            let (row, col) = screen.cursor_position();
-            if row < inner_rect.height && col < inner_rect.width {
-                f.set_cursor_position((inner_rect.x + col, inner_rect.y + row));
-                cursor_style = Some(screen.cursor_style());
+        let selection = copy_state.and_then(|s| {
+            s.selection_anchor.map(|(a_row, a_col)| {
+                let (sr, sc, er, ec) = if a_row < s.cursor_abs_row
+                    || (a_row == s.cursor_abs_row && a_col <= s.cursor_col)
+                {
+                    (a_row, a_col, s.cursor_abs_row, s.cursor_col)
+                } else {
+                    (s.cursor_abs_row, s.cursor_col, a_row, a_col)
+                };
+                let cols = screen.size().1.get();
+                if s.line_wise {
+                    SelectionRange { start_abs_row: sr, start_col: 0, end_abs_row: er, end_col: cols.saturating_sub(1) }
+                } else {
+                    SelectionRange { start_abs_row: sr, start_col: sc, end_abs_row: er, end_col: ec }
+                }
+            })
+        });
+
+        render_screen(screen, inner_rect, f.buffer_mut(), selection);
+
+        if is_focused {
+            if let Some(s) = copy_state {
+                let top_abs = screen.scrollback_len().saturating_sub(screen.scrollback());
+                if s.cursor_abs_row >= top_abs && s.cursor_abs_row < top_abs + inner_rect.height as usize {
+                    let vis_row = (s.cursor_abs_row - top_abs) as u16;
+                    let vis_col = s.cursor_col.min(inner_rect.width.saturating_sub(1));
+                    f.set_cursor_position((inner_rect.x + vis_col, inner_rect.y + vis_row));
+                    cursor_style = Some(vt100::CursorStyle::SteadyBlock);
+                }
+            } else if app.mode == Mode::Normal && screen.scrollback() == 0 && !screen.hide_cursor() {
+                let (row, col) = screen.cursor_position();
+                if row < inner_rect.height && col < inner_rect.width {
+                    f.set_cursor_position((inner_rect.x + col, inner_rect.y + row));
+                    cursor_style = Some(screen.cursor_style());
+                }
             }
         }
     }
@@ -229,6 +294,15 @@ fn draw_status(f: &mut Frame, app: &mut App, theme: &Theme, bar: Rect) {
     ));
     match &app.mode {
         Mode::Prefix => spans.push(Span::styled(" PREFIX ", Style::new().bg(theme.working).fg(theme.bar_bg))),
+        Mode::Copy(state) => {
+            let sel = if state.selection_anchor.is_some() {
+                if state.line_wise { " [LINE SELECT] " } else { " [SELECT] " }
+            } else {
+                " [COPY MODE] "
+            };
+            spans.push(Span::styled(sel, Style::new().bg(theme.working).fg(theme.bar_bg).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(" y: copy, v: select, V: line, q: exit ", Style::new().fg(theme.bar_fg)));
+        }
         _ => {
             if let Some(m) = app.current_message() {
                 spans.push(Span::styled(format!("│ {m}"), Style::new().fg(theme.working)));
@@ -285,6 +359,6 @@ fn draw_overlay(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             f.render_widget(Clear, r);
             f.render_widget(Paragraph::new(q).wrap(Wrap { trim: true }).block(block("confirm")), r);
         }
-        Mode::Normal | Mode::Prefix => {}
+        Mode::Normal | Mode::Prefix | Mode::Copy(_) => {}
     }
 }

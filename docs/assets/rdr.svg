@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f141c" />
+      <stop offset="100%" stop-color="#080a0f" />
+    </linearGradient>
+    <linearGradient id="sweepGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.35" />
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0.0" />
+    </linearGradient>
+    <filter id="neonGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur" />
+      <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+    </filter>
+    <filter id="subtleGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+    </filter>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#bgGrad)" stroke="#1e293b" stroke-width="4" />
+  <g fill="none" stroke="#1e293b" stroke-width="2.5">
+    <circle cx="256" cy="256" r="190" stroke-opacity="0.4" />
+    <circle cx="256" cy="256" r="135" stroke-dasharray="6 6" stroke-opacity="0.6" />
+    <circle cx="256" cy="256" r="75" stroke-opacity="0.5" />
+  </g>
+  <path d="M 256 256 L 391 121 A 190 190 0 0 0 256 66 Z" fill="url(#sweepGrad)" />
+  <line x1="256" y1="256" x2="390" y2="122" stroke="#34d399" stroke-width="2.5" stroke-linecap="round" filter="url(#subtleGlow)" />
+  <line x1="256" y1="56" x2="256" y2="456" stroke="#0ea5e9" stroke-width="2" stroke-opacity="0.3" stroke-dasharray="8 8" />
+  <line x1="56" y1="256" x2="456" y2="256" stroke="#0ea5e9" stroke-width="2" stroke-opacity="0.3" stroke-dasharray="8 8" />
+  <path d="M 100 130 L 100 100 L 130 100" fill="none" stroke="#475569" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M 230 100 L 236 100" fill="none" stroke="#334155" stroke-width="4" stroke-linecap="round" />
+  <path d="M 382 100 L 412 100 L 412 130" fill="none" stroke="#10b981" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" filter="url(#subtleGlow)" />
+  <path d="M 282 100 L 312 100" fill="none" stroke="#10b981" stroke-width="4" stroke-linecap="round" stroke-opacity="0.7" />
+  <path d="M 100 382 L 100 412 L 130 412" fill="none" stroke="#475569" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M 412 382 L 412 412 L 382 412" fill="none" stroke="#475569" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="160" cy="170" r="7" fill="#f59e0b" filter="url(#neonGlow)" />
+  <circle cx="345" cy="155" r="9" fill="#10b981" filter="url(#neonGlow)" />
+  <circle cx="345" cy="155" r="17" fill="none" stroke="#10b981" stroke-width="2" stroke-opacity="0.5" />
+  <circle cx="175" cy="335" r="7" fill="#ef4444" filter="url(#neonGlow)" />
+  <circle cx="335" cy="335" r="7" fill="#38bdf8" filter="url(#neonGlow)" />
+  <circle cx="256" cy="256" r="14" fill="#0b0f17" stroke="#38bdf8" stroke-width="3" filter="url(#subtleGlow)" />
+  <circle cx="256" cy="256" r="4" fill="#38bdf8" />
+  <text x="216" y="256" font-family="ui-monospace, 'JetBrains Mono', monospace" font-size="20" font-weight="700" fill="#64748b" text-anchor="middle" dominant-baseline="central">h</text>
+  <text x="256" y="296" font-family="ui-monospace, 'JetBrains Mono', monospace" font-size="20" font-weight="700" fill="#64748b" text-anchor="middle" dominant-baseline="central">j</text>
+  <text x="256" y="216" font-family="ui-monospace, 'JetBrains Mono', monospace" font-size="20" font-weight="700" fill="#64748b" text-anchor="middle" dominant-baseline="central">k</text>
+  <text x="296" y="256" font-family="ui-monospace, 'JetBrains Mono', monospace" font-size="20" font-weight="700" fill="#64748b" text-anchor="middle" dominant-baseline="central">l</text>
+</svg>
