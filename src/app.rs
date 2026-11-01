@@ -20,7 +20,7 @@ use crate::desktop::Desktop;
 use crate::ipc::{Request, Response};
 use crate::keys;
 use crate::layout::{self, Dir, Layout};
-use crate::pane::{AgentState, Pane, PaneId, SpawnSpec};
+use crate::pane::{AgentState, Pane, PaneId, SHELLS, SpawnSpec};
 use crate::procinfo;
 
 pub enum Event {
@@ -133,7 +133,6 @@ pub fn inner(r: Rect) -> Rect {
     )
 }
 
-const SHELLS: &[&str] = &["fish", "bash", "zsh", "sh", "dash", "nu", "elvish", "xonsh", ""];
 
 impl App {
     pub fn new(

@@ -81,6 +81,8 @@ pub enum AgentState {
     Idle,
 }
 
+pub const SHELLS: &[&str] = &["fish", "bash", "zsh", "sh", "dash", "nu", "elvish", "xonsh", ""];
+
 pub struct SpawnSpec {
     pub shell: String,
     pub cmd: Option<String>,
@@ -275,11 +277,19 @@ impl Pane {
 
     /// Name of the PTY's foreground process (tmux's `pane_current_command`).
     pub fn current_command(&self) -> String {
-        self.master
-            .process_group_leader()
-            .and_then(|pid| procinfo::comm(pid as u32))
-            .or_else(|| self.child_pid().and_then(procinfo::comm))
-            .unwrap_or_default()
+        let leader = self.master.process_group_leader().map(|p| p as u32).or_else(|| self.child_pid());
+        let Some(leader) = leader else { return String::new() };
+        let cmd = procinfo::comm(leader).unwrap_or_default();
+        // A pane started with `cmd = ...` runs `<shell> -c "cmd; exec <shell>"`.
+        // Without job control the command shares the shell's group, so look
+        // past the shell to what it is running.
+        if SHELLS.contains(&cmd.as_str())
+            && let Some(child) = procinfo::same_group_child(leader)
+            && let Some(c) = procinfo::comm(child)
+        {
+            return c;
+        }
+        cmd
     }
 
     pub fn cwd(&self) -> Option<PathBuf> {

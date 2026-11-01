@@ -16,6 +16,27 @@ pub fn ppid(pid: u32) -> Option<u32> {
 }
 
 /// File name of the program a process is running (`/proc/<pid>/exe`).
+/// The process group of `pid` (field 5 of /proc/<pid>/stat).
+pub fn pgrp(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 2..];
+    rest.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// Direct children of `pid` (needs CONFIG_PROC_CHILDREN, standard on distro kernels).
+pub fn children(pid: u32) -> Vec<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .map(|s| s.split_whitespace().filter_map(|c| c.parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// A shell running `-c "cmd; exec shell"` has no job control, so `cmd` stays
+/// in the shell's process group and the group leader is the shell. Return the
+/// newest child that shares the leader's group: the command it is running.
+pub fn same_group_child(leader: u32) -> Option<u32> {
+    children(leader).into_iter().filter(|&c| pgrp(c) == Some(leader)).max()
+}
+
 pub fn exe_name(pid: u32) -> Option<String> {
     let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     Some(exe.file_name()?.to_string_lossy().into_owned())
