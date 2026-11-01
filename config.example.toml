@@ -1,0 +1,54 @@
+# rdr configuration: ~/.config/rdr/config.toml
+# Every key is optional. Without [workspaces.*] tables rdr opens
+# 1:agents (quad) and 2:editor (single, untracked).
+
+[general]
+default_shell = "/usr/bin/fish"
+session_name = "rdr"            # socket: $XDG_RUNTIME_DIR/rdr/<session_name>.sock
+notification_popups = false     # desktop popup when an agent finishes (Alt+n)
+taskbar_badge = true            # KDE/Unity LauncherEntry badge with finished count
+finish_scope = "all"            # "all" tracked workspaces, or "agents" only (Alt+f)
+default_layout = "quad"         # for `rdr <dir>` and Ctrl+b a
+scrollback = 10000
+# start_workspace = 1
+# agent_commands = ["agy", "oc", "opencode", "claude", "aider", "ai", "pi", "gemini", "codex"]
+# badge_app_uris = ["application://rdr.desktop"]   # matches the WM class rdr sets on new windows
+# terminal = "kitty"            # for launches without a TTY (KRunner, app menu) and --term;
+#                               # unset: $TERMINAL, then ghostty, kitty, wezterm, foot, alacritty, konsole, ...
+clear_on_start = true           # clear fresh shell panes once greetings/fastfetch settle
+taskbar_identity = true         # KDE: own taskbar entry instead of grouping with the terminal
+
+[theme]                         # "radar", the rdr icon palette (default)
+border_active = "#10B981"       # focused pane
+border_inactive = "#334155"
+status_bg = "#0F141C"
+status_fg = "#CBD5E1"
+working = "#F59E0B"             # agent working
+finished = "#38BDF8"            # agent finished
+# Nord instead:  #88C0D0 #4C566A #2E3440 #D8DEE9 #EBCB8B #A3BE8C
+
+# Each pane `cmd` runs as `<shell> -c "<cmd>; exec <shell>"` (set hold = false
+# to close the pane when the command exits).
+[workspaces.0]
+name = "telemetry"
+layout = "cockpit"              # [0 | 1] over [2 | 3 | 4]
+tracked = false
+cwd = "~"
+panes = [
+  { title = "Logs",     cmd = "journalctl --user -f -n 100 --output=cat | grep --line-buffered -E 'WARN|ERROR'" },
+  { title = "Top",      cmd = "htop" },
+  { title = "Disk",     cmd = "watch -c -n 5 df -h" },
+  { title = "Network",  cmd = "watch -c -n 5 ss -tuln" },
+  { title = "Tokens",   cmd = "rdr tokens --watch" },
+]
+
+[workspaces.1]
+name = "agents"
+layout = "quad"
+count = 4
+
+[workspaces.2]
+name = "editor"
+layout = "single"
+tracked = false
+cmd = "nvim"

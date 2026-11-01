@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=rdreh
+GenericName=Agent Multiplexer
+Comment=Keyboard-first terminal multiplexer for AI coding agents
+Exec=rdr
+TryExec=rdr
+Icon=rdr
+Terminal=false
+StartupWMClass=rdr
+Categories=Development;System;Utility;
+Keywords=rdr;rdreh;herdr;ai;agent;swarm;multiplexer;tmux;terminal;
