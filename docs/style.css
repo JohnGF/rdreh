@@ -60,7 +60,7 @@ h1, h2, h3, code, pre { font-family: var(--font-mono); }
 .btn-primary { background-color: var(--accent-green); color: #000; }
 .btn-secondary { background-color: var(--panels); color: var(--text); border: 1px solid var(--inactive-border); }
 
-.mock-terminal { border: 1px solid var(--inactive-border); border-radius: 8px; background-color: var(--panels); overflow: hidden; aspect-ratio: 16 / 10; display: flex; flex-direction: column; position: relative; box-shadow: 0 10px 30px rgba(0,0,0,0.5); transition: border-color 0.3s ease; width: 100%; }
+.mock-terminal { border: 1px solid var(--inactive-border); border-radius: 8px; background-color: var(--panels); overflow: hidden; display: flex; flex-direction: column; position: relative; box-shadow: 0 10px 30px rgba(0,0,0,0.5); transition: border-color 0.3s ease; width: 100%; }
 .mock-terminal:hover { border-color: var(--accent-green); }
 .mock-header { height: 32px; background-color: var(--bg); border-bottom: 1px solid var(--inactive-border); display: flex; align-items: center; padding: 0 12px; position: relative; }
 .mock-dots { display: flex; gap: 6px; }
@@ -69,7 +69,7 @@ h1, h2, h3, code, pre { font-family: var(--font-mono); }
 .mock-dots span:nth-child(2) { background-color: #F59E0B; }
 .mock-dots span:nth-child(3) { background-color: #10B981; }
 .mock-title { position: absolute; left: 50%; transform: translateX(-50%); font-family: var(--font-mono); font-size: 0.8rem; color: var(--muted); }
-.mock-body { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; background: var(--panels); }
+.mock-body { flex: 1; aspect-ratio: 16 / 10; display: flex; align-items: center; justify-content: center; position: relative; background: var(--panels); }
 .mock-placeholder-text { color: var(--muted); font-family: var(--font-mono); font-size: 0.95rem; text-align: center; padding: 1rem; }
 .mock-placeholder-text small { opacity: 0.7; }
 .mock-img { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; z-index: 10; }
@@ -88,7 +88,7 @@ h1, h2, h3, code, pre { font-family: var(--font-mono); }
 .keys-section { padding: 4rem 0; }
 .keys-wrapper h2 { text-align: center; margin-bottom: 2rem; color: var(--text); }
 .keys-terminal { aspect-ratio: auto; height: auto; max-width: 700px; margin: 0 auto; }
-.keys-body { align-items: flex-start; justify-content: flex-start; padding: 1.5rem; overflow-x: auto; }
+.keys-body { aspect-ratio: auto; align-items: flex-start; justify-content: flex-start; padding: 1.5rem; overflow-x: auto; }
 .keys-body pre { color: var(--text); font-size: 0.85rem; line-height: 1.4; white-space: pre-wrap; }
 
 .comparison-section { padding: 4rem 0 6rem; }
