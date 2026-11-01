@@ -190,6 +190,15 @@ version-number process title (`2.1.x`) also counts. Shell panes never count.
 The mouse is captured, so use Shift+drag for your terminal's native text
 selection.
 
+## Platforms
+
+| Platform | Status |
+| --- | --- |
+| Linux, KDE Plasma | Tested daily: badge, notifications, own taskbar icon. |
+| Linux, other desktops / tiling WMs / SSH | Core works anywhere. Notifications need a freedesktop notification daemon; the taskbar badge needs a dock that supports it (e.g. Ubuntu Dock). Missing pieces are skipped silently. Works without systemd. |
+| macOS | Not yet supported (agent detection reads `/proc`). See [TODO.md](TODO.md). |
+| Windows | Use WSL2. A native PowerShell / Windows Terminal port is planned in [TODO.md](TODO.md). |
+
 ## Testing
 
 ```sh
