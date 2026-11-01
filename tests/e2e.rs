@@ -628,7 +628,7 @@ fn agy_blob(input: u64, output: u64, cached: u64) -> Vec<u8> {
 }
 
 #[test]
-fn tokens_reads_all_three_tools_and_sorts_by_total() {
+fn tokens_reads_every_tool_and_sorts_by_total() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     let data = dir.path().join("data");
@@ -652,6 +652,17 @@ fn tokens_reads_all_three_tools_and_sorts_by_total() {
         .join("\n"),
     )
     .unwrap();
+
+    // pi: one reply, repeated in a forked session file (same responseId), plus a user message.
+    let pi = |sid: &str| {
+        let d = home.join(".pi/agent/sessions/--tmp-x--");
+        std::fs::create_dir_all(&d).unwrap();
+        let reply = format!(r#"{{"type":"message","id":"a1","timestamp":"{now}","message":{{"role":"assistant","responseId":"resp-1","usage":{{"input":400,"output":60,"cacheRead":0,"cacheWrite":0,"reasoning":20,"totalTokens":460}}}}}}"#);
+        let user = format!(r#"{{"type":"message","id":"u1","timestamp":"{now}","message":{{"role":"user","content":[{{"type":"text","text":"hi"}}]}}}}"#);
+        std::fs::write(d.join(format!("{sid}.jsonl")), format!("{{\"type\":\"session\",\"id\":\"{sid}\"}}\n{user}\n{reply}\n")).unwrap();
+    };
+    pi("s1");
+    pi("s1-fork");
 
     // OpenCode: one assistant message now, one user message.
     std::fs::create_dir_all(data.join("opencode")).unwrap();
@@ -687,10 +698,11 @@ fn tokens_reads_all_three_tools_and_sorts_by_total() {
     let totals = |w: &Value| -> Vec<(String, u64)> {
         w["tools"].as_array().unwrap().iter().map(|t| (t["tool"].as_str().unwrap().to_string(), t["total"].as_u64().unwrap())).collect()
     };
-    // claude today: 100+50+1000 (m1 once); agy: 5300+20000 + 1200; opencode: 20+10+10+2.
+    // claude today: 100+50+1000 (m1 once); agy: 5300+20000 + 1200; pi: 460 once
+    // (reasoning is inside output); opencode: 20+10+10+2.
     assert_eq!(
         totals(&window("today")),
-        [("agy".into(), 26_500), ("claude".into(), 1_150), ("opencode".into(), 42)]
+        [("agy".into(), 26_500), ("claude".into(), 1_150), ("pi".into(), 460), ("opencode".into(), 42)]
     );
     // The 2020 claude message only shows up in all-time.
     let all = totals(&window("all_time"));
@@ -726,13 +738,17 @@ fn tokens_reads_all_three_tools_and_sorts_by_total() {
     };
     let agy_line = strip(today.lines().find(|l| l.contains("agy")).unwrap());
     let cols: Vec<&str> = agy_line.split_whitespace().filter(|w| !w.contains('█')).collect();
-    assert_eq!(cols, ["agy", "26.5k", "96%", "26.0k", "500", "77%"], "{agy_line}");
+    // share: 26,500 of 28,152 (agy + claude + pi + opencode)
+    assert_eq!(cols, ["agy", "26.5k", "94%", "26.0k", "500", "77%"], "{agy_line}");
     let claude_line = strip(today.lines().find(|l| l.contains("claude")).unwrap());
     let cols: Vec<&str> = claude_line.split_whitespace().filter(|w| !w.contains('█')).collect();
     assert_eq!(cols[3..], ["1.1k", "50", "91%"], "{claude_line}");
     let oc_line = strip(today.lines().find(|l| l.contains("opencode")).unwrap());
     let cols: Vec<&str> = oc_line.split_whitespace().collect();
     assert_eq!(cols[3..], ["32", "10", "31%"], "{oc_line}"); // in 20+10+2, out 5+5 reasoning
+    let pi_line = today.lines().map(strip).find(|l| l.trim_start().starts_with("pi ")).unwrap();
+    let cols: Vec<&str> = pi_line.split_whitespace().filter(|w| !w.contains('█')).collect();
+    assert_eq!(cols, ["pi", "460", "2%", "400", "60", "0%"], "{pi_line}");
 }
 
 /// Current UTC time as RFC 3339 without pulling in a date crate.

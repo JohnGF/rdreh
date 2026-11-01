@@ -1,20 +1,21 @@
 //! `rdr tokens`: token usage per agent tool, read from each tool's local data.
 //!
-//! - Claude Code: `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR`).
-//!   Usage per assistant message; streamed blocks repeat the same message id
-//!   with identical usage, so the first occurrence counts.
+//! - JSON-lines harnesses, described as data ([`JsonlSpec`]): Claude Code
+//!   (`~/.claude/projects/**/*.jsonl`, or `$CLAUDE_CONFIG_DIR`) and pi
+//!   (`~/.pi/agent/sessions/**/*.jsonl`) are built in; `[[tokens.jsonl]]` in
+//!   the config adds others without code.
 //! - OpenCode: `$XDG_DATA_HOME/opencode/opencode.db`, `message.data.tokens`.
 //! - agy (Antigravity CLI): `~/.gemini/antigravity-cli/conversations/*.db`.
 //!   Unofficial: usage is decoded from the protobuf in `gen_metadata.data` at
 //!   field path 1.4 (2 = input, 3 = output, 5 = cached). Records carry no
 //!   timestamp, so usage is dated by the conversation file's mtime.
 //!
-//! Scanning is incremental: Claude files are read from their last offset, agy
-//! databases only when their mtime changes. The scanner state is cached on
-//! disk (`$XDG_CACHE_HOME/rdr/tokens.json`), so a new `rdr tokens` only reads
-//! what changed since the last run instead of the whole history.
+//! Scanning is incremental: JSON-lines files are read from their last offset,
+//! databases only when they change. The scanner state is cached on disk
+//! (`$XDG_CACHE_HOME/rdr/tokens.json`), so a new `rdr tokens` only reads what
+//! changed since the last run instead of the whole history.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,42 +53,133 @@ impl Usage {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, PartialOrd, Ord)]
-#[serde(rename_all = "lowercase")]
-pub enum Tool {
-    Claude,
-    OpenCode,
-    Agy,
+// --------------------------------------------------------------- sources
+
+/// A harness that logs one JSON object per line, described as data rather
+/// than code. Claude Code and pi are built in; more come from
+/// `[[tokens.jsonl]]` in the config (same `name` replaces a built-in).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JsonlSpec {
+    /// Row label in the report.
+    pub name: String,
+    /// Directory searched recursively for `*.<ext>` files; `~/` is expanded.
+    pub dir: PathBuf,
+    #[serde(default = "default_ext")]
+    pub ext: String,
+    /// Only lines where every dotted path holds this string value count.
+    #[serde(default)]
+    pub when: BTreeMap<String, String>,
+    /// Dotted paths joined into the dedup key: a message logged twice, or
+    /// copied into another file by a resume or fork, counts once. When none
+    /// of them is present, every line counts.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub id: Vec<String>,
+    /// RFC 3339 string or Unix time (seconds or milliseconds).
+    #[serde(default)]
+    pub time: Option<String>,
+    /// Each usage field is a path, or a list of paths that are summed.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub input: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub output: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub cache_read: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub cache_write: Vec<String>,
 }
 
-pub const TOOLS: [Tool; 3] = [Tool::Claude, Tool::OpenCode, Tool::Agy];
+fn default_ext() -> String {
+    "jsonl".into()
+}
 
-impl Tool {
-    pub fn name(self) -> &'static str {
-        match self {
-            Tool::Claude => "claude",
-            Tool::OpenCode => "opencode",
-            Tool::Agy => "agy",
-        }
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
+fn paths(p: &[&str]) -> Vec<String> {
+    p.iter().map(|s| s.to_string()).collect()
+}
+
+/// Claude Code: `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR`).
+/// Streamed blocks repeat a message with identical usage; the key dedups them.
+pub fn claude_spec(projects: PathBuf) -> JsonlSpec {
+    JsonlSpec {
+        name: "claude".into(),
+        dir: projects,
+        ext: default_ext(),
+        when: [("type".to_string(), "assistant".to_string())].into(),
+        id: paths(&["message.id", "requestId"]),
+        time: Some("timestamp".into()),
+        input: paths(&["message.usage.input_tokens"]),
+        output: paths(&["message.usage.output_tokens"]),
+        cache_read: paths(&["message.usage.cache_read_input_tokens"]),
+        cache_write: paths(&["message.usage.cache_creation_input_tokens"]),
     }
 }
 
-pub struct Paths {
-    pub claude_projects: PathBuf,
+/// pi: `~/.pi/agent/sessions/**/*.jsonl`. `output` already includes
+/// reasoning (`totalTokens` = input + output + cacheRead + cacheWrite).
+pub fn pi_spec(sessions: PathBuf) -> JsonlSpec {
+    JsonlSpec {
+        name: "pi".into(),
+        dir: sessions,
+        ext: default_ext(),
+        when: [("type".to_string(), "message".to_string()), ("message.role".to_string(), "assistant".to_string())].into(),
+        id: paths(&["message.responseId"]),
+        time: Some("timestamp".into()),
+        input: paths(&["message.usage.input"]),
+        output: paths(&["message.usage.output"]),
+        cache_read: paths(&["message.usage.cacheRead"]),
+        cache_write: paths(&["message.usage.cacheWrite"]),
+    }
+}
+
+/// `[tokens]` in config.toml.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokensConfig {
+    /// Extra JSON-lines harnesses, or overrides of `claude` / `pi`.
+    pub jsonl: Vec<JsonlSpec>,
+}
+
+/// Where each tool's data lives.
+pub struct Sources {
+    pub jsonl: Vec<JsonlSpec>,
     pub opencode_db: PathBuf,
     pub agy_conversations: PathBuf,
 }
 
-impl Paths {
-    pub fn detect() -> Paths {
+impl Sources {
+    pub fn detect(cfg: &TokensConfig) -> Sources {
         let home = dirs::home_dir().unwrap_or_default();
         let claude = std::env::var_os("CLAUDE_CONFIG_DIR")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".claude"));
         let data = dirs::data_dir().unwrap_or_else(|| home.join(".local/share"));
-        Paths {
-            claude_projects: claude.join("projects"),
+        let mut jsonl = vec![claude_spec(claude.join("projects")), pi_spec(home.join(".pi/agent/sessions"))];
+        for spec in &cfg.jsonl {
+            let mut spec = spec.clone();
+            if let Ok(rest) = spec.dir.strip_prefix("~") {
+                spec.dir = home.join(rest);
+            }
+            match jsonl.iter_mut().find(|s| s.name == spec.name) {
+                Some(slot) => *slot = spec,
+                None => jsonl.push(spec),
+            }
+        }
+        Sources {
+            jsonl,
             opencode_db: data.join("opencode/opencode.db"),
             agy_conversations: home.join(".gemini/antigravity-cli/conversations"),
         }
@@ -155,67 +247,76 @@ fn mtime_ms(m: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-// ---------------------------------------------------------------- claude
+// ----------------------------------------------------------------- jsonl
 
-#[derive(Deserialize)]
-struct ClaudeLine {
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    timestamp: Option<String>,
-    #[serde(rename = "requestId")]
-    request_id: Option<String>,
-    message: Option<ClaudeMessage>,
+fn at<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    path.split('.').try_fold(v, |v, k| v.get(k))
 }
 
-#[derive(Deserialize)]
-struct ClaudeMessage {
-    id: Option<String>,
-    usage: Option<ClaudeUsage>,
+fn as_count(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct ClaudeUsage {
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_input_tokens: u64,
-    cache_creation_input_tokens: u64,
-}
-
-/// (dedup key, timestamp, usage) from one transcript line, if it is an
-/// assistant message with usage.
-fn parse_claude_line(line: &str) -> Option<(String, i64, Usage)> {
-    if !line.contains("\"usage\"") {
-        return None;
+fn as_time_ms(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::String(s) => parse_rfc3339_ms(s),
+        // Below 1e11 it is seconds (1e11 s is the year 5138).
+        v => v.as_f64().map(|t| if t < 1e11 { (t * 1000.0) as i64 } else { t as i64 }),
     }
-    let l: ClaudeLine = serde_json::from_str(line).ok()?;
-    if l.kind.as_deref() != Some("assistant") {
-        return None;
+}
+
+impl JsonlSpec {
+    /// Cheap pre-check: a line naming none of the usage fields is not parsed.
+    fn needles(&self) -> Vec<String> {
+        [&self.input, &self.output, &self.cache_read, &self.cache_write]
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.rsplit('.').next())
+            .map(|k| format!("\"{k}\""))
+            .collect()
     }
-    let msg = l.message?;
-    let u = msg.usage?;
-    let key = format!("{}:{}", msg.id.unwrap_or_default(), l.request_id.unwrap_or_default());
-    let ts = l.timestamp.as_deref().and_then(parse_rfc3339_ms).unwrap_or(0);
-    Some((
-        key,
-        ts,
-        Usage {
-            input: u.input_tokens,
-            output: u.output_tokens,
-            cache_read: u.cache_read_input_tokens,
-            cache_write: u.cache_creation_input_tokens,
+
+    /// (dedup key, timestamp ms, usage) when the line is a counted record.
+    /// Lines without any usage field are not records.
+    fn parse(&self, line: &str, needles: &[String]) -> Option<(Option<String>, i64, Usage)> {
+        if !needles.iter().any(|n| line.contains(n.as_str())) {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        if !self.when.iter().all(|(p, want)| at(&v, p).and_then(|x| x.as_str()) == Some(want.as_str())) {
+            return None;
+        }
+        let mut found = false;
+        let mut sum = |ps: &[String]| -> u64 {
+            ps.iter()
+                .filter_map(|p| at(&v, p).and_then(as_count))
+                .inspect(|_| found = true)
+                .sum()
+        };
+        let u = Usage {
+            input: sum(&self.input),
+            output: sum(&self.output),
+            cache_read: sum(&self.cache_read),
+            cache_write: sum(&self.cache_write),
             calls: 1,
-        },
-    ))
+        };
+        if !found {
+            return None;
+        }
+        let parts: Vec<Option<&str>> = self.id.iter().map(|p| at(&v, p).and_then(|x| x.as_str())).collect();
+        let key = parts.iter().any(Option::is_some).then(|| parts.iter().map(|p| p.unwrap_or("")).collect::<Vec<_>>().join(":"));
+        let ts = self.time.as_deref().and_then(|p| at(&v, p)).and_then(as_time_ms).unwrap_or(0);
+        Some((key, ts, u))
+    }
 }
 
-fn jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) {
+fn data_files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
         match e.file_type() {
-            Ok(t) if t.is_dir() => jsonl_files(&p, out),
-            Ok(t) if t.is_file() && p.extension().is_some_and(|x| x == "jsonl") => out.push(p),
+            Ok(t) if t.is_dir() => data_files(&p, ext, out),
+            Ok(t) if t.is_file() && p.extension().is_some_and(|x| x == ext) => out.push(p),
             _ => {}
         }
     }
@@ -303,7 +404,7 @@ fn open_ro(path: &Path) -> rusqlite::Result<rusqlite::Connection> {
 // --------------------------------------------------------------- scanner
 
 #[derive(Default, Serialize, Deserialize)]
-struct ClaudeFile {
+struct JsonlFile {
     /// Inode when last read: a replaced file is read again from the start.
     ino: u64,
     offset: u64,
@@ -311,19 +412,28 @@ struct ClaudeFile {
     events: Vec<(String, i64, Usage)>,
 }
 
-/// Bump when the cached layout or the counting rules change.
-const CACHE_VERSION: u32 = 1;
+/// Incremental state of one JSON-lines source.
+#[derive(Default)]
+struct JsonlState {
+    files: HashMap<PathBuf, JsonlFile>,
+    seen: HashSet<String>,
+}
 
-/// The scanner state persisted between runs.
+/// Bump when the cached layout or the counting rules change.
+const CACHE_VERSION: u32 = 2;
+
+/// The scanner state persisted between runs. Each part is tied to the
+/// source it came from, so changing one source rescans only that one.
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     version: u32,
-    sources: [PathBuf; 3],
-    claude_files: HashMap<PathBuf, ClaudeFile>,
-    agy_files: HashMap<PathBuf, (i64, Usage)>,
+    jsonl: Vec<(JsonlSpec, HashMap<PathBuf, JsonlFile>)>,
+    opencode_db: PathBuf,
     opencode: HashMap<String, (i64, Usage)>,
     opencode_updated: i64,
     opencode_stamp: Option<[(u64, i64); 2]>,
+    agy_conversations: PathBuf,
+    agy_files: HashMap<PathBuf, (i64, Usage)>,
 }
 
 pub fn default_cache_path() -> Option<PathBuf> {
@@ -335,61 +445,64 @@ pub fn default_cache_path() -> Option<PathBuf> {
 }
 
 pub struct Scanner {
-    paths: Paths,
+    sources: Sources,
     cache: Option<PathBuf>,
     /// State changed since the last save.
     dirty: bool,
-    claude_files: HashMap<PathBuf, ClaudeFile>,
-    claude_seen: HashSet<String>,
+    jsonl: Vec<JsonlState>,
     agy_files: HashMap<PathBuf, (i64, Usage)>,
     /// message id -> (created ms, usage); refreshed by time_updated.
     opencode: HashMap<String, (i64, Usage)>,
     opencode_updated: i64,
     /// (len, mtime) of opencode.db and its WAL at the last scan.
     opencode_stamp: Option<[(u64, i64); 2]>,
+    /// Tools whose data location exists, in source order.
+    present: Vec<String>,
     pub errors: Vec<String>,
 }
 
 impl Scanner {
-    pub fn new(paths: Paths) -> Scanner {
+    pub fn new(sources: Sources) -> Scanner {
         Scanner {
-            paths,
+            jsonl: sources.jsonl.iter().map(|_| JsonlState::default()).collect(),
+            sources,
             cache: None,
             dirty: false,
-            claude_files: HashMap::new(),
-            claude_seen: HashSet::new(),
             agy_files: HashMap::new(),
             opencode: HashMap::new(),
             opencode_updated: i64::MIN,
             opencode_stamp: None,
+            present: Vec::new(),
             errors: Vec::new(),
         }
     }
 
     /// A scanner that starts from, and saves back to, the cache at `cache`.
     /// A missing, unreadable or stale cache just means a full scan.
-    pub fn with_cache(paths: Paths, cache: Option<PathBuf>) -> Scanner {
-        let mut sc = Scanner::new(paths);
+    pub fn with_cache(sources: Sources, cache: Option<PathBuf>) -> Scanner {
+        let mut sc = Scanner::new(sources);
         if let Some(path) = &cache
             && let Ok(bytes) = std::fs::read(path)
             && let Ok(snap) = serde_json::from_slice::<Snapshot>(&bytes)
             && snap.version == CACHE_VERSION
-            && snap.sources == sc.sources()
         {
-            sc.claude_seen = snap.claude_files.values().flat_map(|f| f.events.iter().map(|e| e.0.clone())).collect();
-            sc.claude_files = snap.claude_files;
-            sc.agy_files = snap.agy_files;
-            sc.opencode = snap.opencode;
-            sc.opencode_updated = snap.opencode_updated;
-            sc.opencode_stamp = snap.opencode_stamp;
+            for (spec, files) in snap.jsonl {
+                if let Some(i) = sc.sources.jsonl.iter().position(|s| *s == spec) {
+                    let seen = files.values().flat_map(|f| f.events.iter().map(|e| e.0.clone())).collect();
+                    sc.jsonl[i] = JsonlState { files, seen };
+                }
+            }
+            if snap.opencode_db == sc.sources.opencode_db {
+                sc.opencode = snap.opencode;
+                sc.opencode_updated = snap.opencode_updated;
+                sc.opencode_stamp = snap.opencode_stamp;
+            }
+            if snap.agy_conversations == sc.sources.agy_conversations {
+                sc.agy_files = snap.agy_files;
+            }
         }
         sc.cache = cache;
         sc
-    }
-
-    fn sources(&self) -> [PathBuf; 3] {
-        let p = &self.paths;
-        [p.claude_projects.clone(), p.opencode_db.clone(), p.agy_conversations.clone()]
     }
 
     /// Write the state to the cache (atomically) if it changed.
@@ -400,12 +513,19 @@ impl Scanner {
         }
         let snap = Snapshot {
             version: CACHE_VERSION,
-            sources: self.sources(),
-            claude_files: std::mem::take(&mut self.claude_files),
-            agy_files: std::mem::take(&mut self.agy_files),
+            jsonl: self
+                .sources
+                .jsonl
+                .iter()
+                .zip(&mut self.jsonl)
+                .map(|(spec, st)| (spec.clone(), std::mem::take(&mut st.files)))
+                .collect(),
+            opencode_db: self.sources.opencode_db.clone(),
             opencode: std::mem::take(&mut self.opencode),
             opencode_updated: self.opencode_updated,
             opencode_stamp: self.opencode_stamp,
+            agy_conversations: self.sources.agy_conversations.clone(),
+            agy_files: std::mem::take(&mut self.agy_files),
         };
         let res = (|| -> std::io::Result<()> {
             let dir = path.parent().unwrap_or(Path::new("."));
@@ -414,9 +534,11 @@ impl Scanner {
             std::fs::write(&tmp, serde_json::to_vec(&snap)?)?;
             std::fs::rename(&tmp, &path)
         })();
-        self.claude_files = snap.claude_files;
-        self.agy_files = snap.agy_files;
+        for (st, (_, files)) in self.jsonl.iter_mut().zip(snap.jsonl) {
+            st.files = files;
+        }
         self.opencode = snap.opencode;
+        self.agy_files = snap.agy_files;
         match res {
             Ok(()) => self.dirty = false,
             Err(e) => self.errors.push(format!("cache {}: {e}", path.display())),
@@ -425,47 +547,57 @@ impl Scanner {
 
     pub fn refresh(&mut self) {
         let timing = std::env::var_os("RDR_TOKENS_TIMING").is_some();
-        let t = std::time::Instant::now();
+        let mut t = std::time::Instant::now();
+        let mut lap = |what: &str| {
+            if timing {
+                eprint!("{what} {:?}  ", t.elapsed());
+            }
+            t = std::time::Instant::now();
+        };
         self.errors.clear();
-        self.scan_claude();
-        let t_claude = t.elapsed();
+        self.present.clear();
+        for i in 0..self.jsonl.len() {
+            self.scan_jsonl(i);
+            lap(&self.sources.jsonl[i].name.clone());
+        }
         if let Err(e) = self.scan_opencode() {
             self.errors.push(format!("opencode: {e}"));
         }
-        let t_oc = t.elapsed();
+        lap("opencode");
         self.scan_agy();
-        let t_agy = t.elapsed();
+        lap("agy");
         self.save();
+        lap("save");
         if timing {
-            eprintln!(
-                "refresh: claude {:?} opencode {:?} agy {:?} save {:?}",
-                t_claude,
-                t_oc - t_claude,
-                t_agy - t_oc,
-                t.elapsed() - t_agy
-            );
+            eprintln!();
         }
     }
 
-    fn scan_claude(&mut self) {
+    fn scan_jsonl(&mut self, i: usize) {
         use std::os::unix::fs::MetadataExt;
+        let spec = &self.sources.jsonl[i];
+        let st = &mut self.jsonl[i];
+        if spec.dir.is_dir() {
+            self.present.push(spec.name.clone());
+        }
         let mut files = Vec::new();
-        jsonl_files(&self.paths.claude_projects, &mut files);
+        data_files(&spec.dir, &spec.ext, &mut files);
         let metas: Vec<_> = files.into_iter().filter_map(|p| std::fs::metadata(&p).ok().map(|m| (p, m))).collect();
         // A message is counted once, in the first file read that holds it. If
         // a file vanished or was replaced, its messages may live on in another
-        // file, so start Claude over rather than lose or double count them.
+        // file, so start this source over rather than lose or double count.
         let live: HashMap<&PathBuf, &std::fs::Metadata> = metas.iter().map(|(p, m)| (p, m)).collect();
-        let stale = self.claude_files.iter().any(|(p, f)| {
-            live.get(p).is_none_or(|m| m.ino() != f.ino || m.len() < f.offset)
-        });
+        let stale = st
+            .files
+            .iter()
+            .any(|(p, f)| live.get(p).is_none_or(|m| m.ino() != f.ino || m.len() < f.offset));
         if stale {
-            self.claude_files.clear();
-            self.claude_seen.clear();
+            *st = JsonlState::default();
             self.dirty = true;
         }
+        let needles = spec.needles();
         for (path, meta) in metas {
-            let entry = self.claude_files.entry(path.clone()).or_default();
+            let entry = st.files.entry(path.clone()).or_default();
             entry.ino = meta.ino();
             if meta.len() == entry.offset {
                 continue;
@@ -480,11 +612,14 @@ impl Scanner {
             }
             // Only consume complete lines; a partial last line is re-read later.
             let Some(end) = buf.iter().rposition(|&c| c == b'\n') else { continue };
+            let mut pos = entry.offset;
             for line in buf[..end].split(|&c| c == b'\n') {
+                let at_line = pos;
+                pos += line.len() as u64 + 1;
                 let Ok(line) = std::str::from_utf8(line) else { continue };
-                if let Some((key, ts, u)) = parse_claude_line(line)
-                    && self.claude_seen.insert(key.clone())
-                {
+                let Some((key, ts, u)) = spec.parse(line, &needles) else { continue };
+                let key = key.unwrap_or_else(|| format!("{}@{at_line}", path.display()));
+                if st.seen.insert(key.clone()) {
                     entry.events.push((key, ts, u));
                 }
             }
@@ -494,7 +629,7 @@ impl Scanner {
     }
 
     fn scan_opencode(&mut self) -> rusqlite::Result<()> {
-        let db = &self.paths.opencode_db;
+        let db = &self.sources.opencode_db;
         let stamp_of = |p: &Path| std::fs::metadata(p).map(|m| (m.len(), mtime_ms(&m))).unwrap_or((0, 0));
         let mut wal = db.clone().into_os_string();
         wal.push("-wal");
@@ -508,6 +643,7 @@ impl Scanner {
             }
             return Ok(());
         }
+        self.present.push("opencode".into());
         if self.opencode_stamp == Some(stamp) {
             return Ok(()); // nothing written since the last scan
         }
@@ -544,7 +680,14 @@ impl Scanner {
     }
 
     fn scan_agy(&mut self) {
-        let Ok(rd) = std::fs::read_dir(&self.paths.agy_conversations) else { return };
+        let Ok(rd) = std::fs::read_dir(&self.sources.agy_conversations) else {
+            if !self.agy_files.is_empty() {
+                self.agy_files.clear();
+                self.dirty = true;
+            }
+            return;
+        };
+        self.present.push("agy".into());
         let mut live = HashSet::new();
         for e in rd.flatten() {
             let path = e.path();
@@ -584,30 +727,46 @@ impl Scanner {
     }
 
     /// Usage per tool since `since_ms` (all time when None), largest first.
-    pub fn summary(&self, since_ms: Option<i64>) -> Vec<(Tool, Usage)> {
+    /// Lists every tool whose data exists, even at zero.
+    pub fn summary(&self, since_ms: Option<i64>) -> Vec<(String, Usage)> {
         let keep = |ts: i64| since_ms.is_none_or(|s| ts >= s);
-        let mut per: HashMap<Tool, Usage> = TOOLS.iter().map(|t| (*t, Usage::default())).collect();
-        let mut add = |tool: Tool, u: &Usage| per.get_mut(&tool).unwrap().add(u);
-        for f in self.claude_files.values() {
-            for (_, ts, u) in &f.events {
-                if keep(*ts) {
-                    add(Tool::Claude, u);
+        let mut per: Vec<(String, Usage)> = Vec::new();
+        let mut add = |tool: &str, u: Option<&Usage>| {
+            let i = match per.iter().position(|(t, _)| t == tool) {
+                Some(i) => i,
+                None => {
+                    per.push((tool.to_string(), Usage::default()));
+                    per.len() - 1
+                }
+            };
+            if let Some(u) = u {
+                per[i].1.add(u);
+            }
+        };
+        for name in &self.present {
+            add(name, None);
+        }
+        for (spec, st) in self.sources.jsonl.iter().zip(&self.jsonl) {
+            for f in st.files.values() {
+                for (_, ts, u) in &f.events {
+                    if keep(*ts) {
+                        add(&spec.name, Some(u));
+                    }
                 }
             }
         }
         for (ts, u) in self.opencode.values() {
             if keep(*ts) {
-                add(Tool::OpenCode, u);
+                add("opencode", Some(u));
             }
         }
         for (ts, u) in self.agy_files.values() {
             if keep(*ts) {
-                add(Tool::Agy, u);
+                add("agy", Some(u));
             }
         }
-        let mut v: Vec<_> = per.into_iter().collect();
-        v.sort_by(|a, b| b.1.total().cmp(&a.1.total()).then(a.0.cmp(&b.0)));
-        v
+        per.sort_by(|a, b| b.1.total().cmp(&a.1.total()).then_with(|| a.0.cmp(&b.0)));
+        per
     }
 }
 
@@ -640,11 +799,21 @@ const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 const CYAN: &str = "\x1b[38;2;16;185;129m"; // emerald, as in the icon
 
-fn tool_color(t: Tool) -> &'static str {
-    match t {
-        Tool::Claude => "\x1b[38;2;245;158;11m",   // amber
-        Tool::OpenCode => "\x1b[38;2;16;185;129m", // emerald
-        Tool::Agy => "\x1b[38;2;56;189;248m",      // sky
+fn tool_color(tool: &str) -> &'static str {
+    match tool {
+        "claude" => "\x1b[38;2;245;158;11m",   // amber
+        "opencode" => "\x1b[38;2;16;185;129m", // emerald
+        "agy" => "\x1b[38;2;56;189;248m",      // sky
+        "pi" => "\x1b[38;2;167;139;250m",      // violet
+        other => {
+            const MORE: [&str; 4] = [
+                "\x1b[38;2;251;113;133m", // rose
+                "\x1b[38;2;163;230;53m",  // lime
+                "\x1b[38;2;251;146;60m",  // orange
+                "\x1b[38;2;45;212;191m",  // teal
+            ];
+            MORE[other.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize)) % MORE.len()]
+        }
     }
 }
 
@@ -701,10 +870,10 @@ pub fn render(scanner: &Scanner, now: i64, width: usize, swarm: Option<&str>) ->
             } else {
                 "-".into()
             };
-            let color = if t == 0 { DIM } else { tool_color(*tool) };
+            let color = if t == 0 { DIM } else { tool_color(tool) };
             out.push_str(&format!(
                 " {color}{:<9}{RESET} {color}{}{RESET}{}{:>8}{DIM}{:>5}{RESET}{:>8}{:>8}{DIM}{:>6}{RESET}\n",
-                tool.name(),
+                tool.chars().take(9).collect::<String>(),
                 "█".repeat(filled),
                 " ".repeat(bar_w - filled),
                 human(t),
@@ -759,14 +928,67 @@ mod tests {
         assert_eq!(parse_rfc3339_ms("garbage"), None);
     }
 
+    fn parse(spec: &JsonlSpec, line: &str) -> Option<(Option<String>, i64, Usage)> {
+        spec.parse(line, &spec.needles())
+    }
+
     #[test]
     fn claude_line() {
+        let spec = claude_spec(PathBuf::new());
         let l = r#"{"type":"assistant","timestamp":"1970-01-01T00:00:01Z","requestId":"r1","message":{"id":"m1","model":"x","usage":{"input_tokens":2,"cache_creation_input_tokens":10,"cache_read_input_tokens":100,"output_tokens":5}}}"#;
-        let (key, ts, u) = parse_claude_line(l).unwrap();
-        assert_eq!((key.as_str(), ts), ("m1:r1", 1000));
+        let (key, ts, u) = parse(&spec, l).unwrap();
+        assert_eq!((key.as_deref(), ts), (Some("m1:r1"), 1000));
         assert_eq!((u.input, u.output, u.cache_read, u.cache_write, u.total()), (2, 5, 100, 10, 117));
-        assert!(parse_claude_line(r#"{"type":"user","message":{"usage":{}}}"#).is_none());
-        assert!(parse_claude_line("not json \"usage\"").is_none());
+        assert!(parse(&spec, r#"{"type":"user","message":{"usage":{"input_tokens":1}}}"#).is_none());
+        assert!(parse(&spec, r#"{"type":"assistant","message":{"id":"m","content":"no usage"}}"#).is_none());
+        assert!(parse(&spec, "not json \"input_tokens\"").is_none());
+    }
+
+    #[test]
+    fn pi_line() {
+        let spec = pi_spec(PathBuf::new());
+        let l = r#"{"type":"message","id":"db79b709","timestamp":"2026-11-01T14:27:00.512Z","message":{"role":"assistant","responseId":"M0zn","usage":{"input":4057,"output":9,"cacheRead":3,"cacheWrite":1,"reasoning":4,"totalTokens":4070}}}"#;
+        let (key, ts, u) = parse(&spec, l).unwrap();
+        assert_eq!((key.as_deref(), ts), (Some("M0zn"), parse_rfc3339_ms("2026-11-01T14:27:00.512Z").unwrap()));
+        // Reasoning is already part of output: not added twice.
+        assert_eq!((u.input, u.output, u.cache_read, u.cache_write, u.total()), (4057, 9, 3, 1, 4070));
+        let user = r#"{"type":"message","message":{"role":"user","usage":{"input":1}}}"#;
+        assert!(parse(&spec, user).is_none());
+    }
+
+    #[test]
+    fn config_defined_source() {
+        let cfg: TokensConfig = toml::from_str(
+            r#"
+            [[jsonl]]
+            name = "acme"
+            dir = "~/acme/logs"
+            ext = "log"
+            when = { kind = "reply" }
+            time = "ts"
+            input = ["usage.prompt", "usage.prompt_cached"]
+            output = "usage.completion"
+            "#,
+        )
+        .unwrap();
+        let spec = &cfg.jsonl[0];
+        // Epoch seconds and summed input paths; no id, so every line counts.
+        let (key, ts, u) = parse(spec, r#"{"kind":"reply","ts":1700000000,"usage":{"prompt":10,"prompt_cached":5,"completion":2}}"#).unwrap();
+        assert_eq!((key, ts, u.input, u.output), (None, 1_700_000_000_000, 15, 2));
+        let (_, ts, _) = parse(spec, r#"{"kind":"reply","ts":1700000000123,"usage":{"completion":1}}"#).unwrap();
+        assert_eq!(ts, 1_700_000_000_123);
+        assert!(parse(spec, r#"{"kind":"ping","usage":{"prompt":1}}"#).is_none());
+
+        // `~/` is expanded, a new name is appended, a built-in name replaces.
+        let pi_override = JsonlSpec { name: "pi".into(), dir: "/elsewhere".into(), ..pi_spec(PathBuf::new()) };
+        let srcs = Sources::detect(&TokensConfig { jsonl: vec![spec.clone(), pi_override] });
+        let names: Vec<_> = srcs.jsonl.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["claude", "pi", "acme"]);
+        assert_eq!(srcs.jsonl[1].dir, PathBuf::from("/elsewhere"));
+        assert!(srcs.jsonl[2].dir.is_absolute() && srcs.jsonl[2].dir.ends_with("acme/logs"));
+
+        // Typos are errors, not silently ignored settings.
+        assert!(toml::from_str::<TokensConfig>("[[jsonl]]\nname='x'\ndir='/x'\ninptu='a'").is_err());
     }
 
     pub fn pb_varint(mut v: u64, out: &mut Vec<u8>) {
@@ -826,14 +1048,13 @@ mod tests {
         let mut f = std::fs::File::create(&file).unwrap();
         writeln!(f, "{}", claude_json("a", "2026-01-01T00:00:00Z", 10)).unwrap();
         writeln!(f, "{}", claude_json("a", "2026-01-01T00:00:00Z", 10)).unwrap(); // streamed duplicate
-        let paths = Paths {
-            claude_projects: dir.path().join("projects"),
+        let mut sc = Scanner::new(Sources {
+            jsonl: vec![claude_spec(dir.path().join("projects"))],
             opencode_db: dir.path().join("none.db"),
             agy_conversations: dir.path().join("none"),
-        };
-        let mut sc = Scanner::new(paths);
+        });
         sc.refresh();
-        let claude = |sc: &Scanner| sc.summary(None).into_iter().find(|(t, _)| *t == Tool::Claude).unwrap().1;
+        let claude = |sc: &Scanner| sc.summary(None).into_iter().find(|(t, _)| t == "claude").map(|r| r.1).unwrap_or_default();
         assert_eq!((claude(&sc).input, claude(&sc).calls), (10, 1));
 
         // A half-written line is not counted until its newline arrives.
@@ -850,7 +1071,7 @@ mod tests {
 
         // Windows filter by message timestamp.
         let since = parse_rfc3339_ms("2026-01-02T00:00:00Z");
-        assert_eq!(sc.summary(since).into_iter().find(|(t, _)| *t == Tool::Claude).unwrap().1.input, 5);
+        assert_eq!(sc.summary(since).into_iter().find(|(t, _)| t == "claude").unwrap().1.input, 5);
     }
 
     #[test]
@@ -860,12 +1081,12 @@ mod tests {
         let proj = dir.path().join("projects/p");
         std::fs::create_dir_all(&proj).unwrap();
         let cache = dir.path().join("cache/tokens.json");
-        let paths = || Paths {
-            claude_projects: dir.path().join("projects"),
+        let paths = || Sources {
+            jsonl: vec![claude_spec(dir.path().join("projects"))],
             opencode_db: dir.path().join("none.db"),
             agy_conversations: dir.path().join("none"),
         };
-        let claude = |sc: &Scanner| sc.summary(None).into_iter().find(|(t, _)| *t == Tool::Claude).unwrap().1;
+        let claude = |sc: &Scanner| sc.summary(None).into_iter().find(|(t, _)| t == "claude").map(|r| r.1).unwrap_or_default();
         let fresh = || {
             let mut sc = Scanner::new(paths());
             sc.refresh();
@@ -908,7 +1129,7 @@ mod tests {
 
         // A cache made for other source paths is ignored.
         let mut other = Scanner::with_cache(
-            Paths { claude_projects: dir.path().join("elsewhere"), ..paths() },
+            Sources { jsonl: vec![claude_spec(dir.path().join("elsewhere"))], ..paths() },
             Some(cache.clone()),
         );
         assert_eq!(claude(&other).calls, 0);
@@ -931,13 +1152,12 @@ mod tests {
              INSERT INTO message VALUES ('a','s',1000,1000,'{\"role\":\"assistant\",\"tokens\":{\"input\":10,\"output\":0}}');",
         )
         .unwrap();
-        let paths = Paths {
-            claude_projects: dir.path().join("none"),
+        let mut sc = Scanner::new(Sources {
+            jsonl: vec![claude_spec(dir.path().join("none"))],
             opencode_db: db.clone(),
             agy_conversations: dir.path().join("none"),
-        };
-        let mut sc = Scanner::new(paths);
-        let oc = |sc: &Scanner| sc.summary(None).into_iter().find(|(t, _)| *t == Tool::OpenCode).unwrap().1;
+        });
+        let oc = |sc: &Scanner| sc.summary(None).into_iter().find(|(t, _)| t == "opencode").unwrap().1;
         sc.refresh();
         assert_eq!((oc(&sc).total(), oc(&sc).calls), (10, 1));
         // The streaming message completes (same id, later time_updated) and a new one lands.

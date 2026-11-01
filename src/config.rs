@@ -17,6 +17,8 @@ pub struct Config {
     pub theme: Theme,
     /// Keyed by workspace number ("0".."9"), as in `[workspaces.1]`.
     pub workspaces: BTreeMap<String, WorkspaceConfig>,
+    /// `rdr tokens` sources: `[[tokens.jsonl]]` adds a harness.
+    pub tokens: crate::tokens::TokensConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

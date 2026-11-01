@@ -52,3 +52,16 @@ name = "editor"
 layout = "single"
 tracked = false
 cmd = "nvim"
+
+# rdr tokens: Claude Code, OpenCode, agy and pi are read out of the box.
+# Any harness that logs JSON lines can be added (see README, "Adding another harness"):
+# [[tokens.jsonl]]
+# name = "mytool"
+# dir = "~/.mytool/sessions"
+# when = { type = "message", "message.role" = "assistant" }
+# id = "message.responseId"
+# time = "timestamp"
+# input = "message.usage.input"
+# output = "message.usage.output"
+# cache_read = "message.usage.cacheRead"
+# cache_write = "message.usage.cacheWrite"

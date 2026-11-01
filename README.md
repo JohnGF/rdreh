@@ -97,6 +97,32 @@ cache read, cache write). The numbers come from each tool's own local records:
 | Claude Code | `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR`). Streamed duplicates are counted once. |
 | OpenCode | `$XDG_DATA_HOME/opencode/opencode.db` |
 | agy (Antigravity CLI) | `~/.gemini/antigravity-cli/conversations/*.db`. *Unofficial:* usage is decoded from protobuf metadata and dated by the conversation file's modification time. |
+| pi | `~/.pi/agent/sessions/**/*.jsonl`. Replies copied into a forked session are counted once. |
+
+A tool shows up once its data folder exists.
+
+#### Adding another harness
+
+Most agent harnesses log one JSON object per line. Describe the format in
+`config.toml` and rdreh counts it, with no code change (Claude Code and pi are
+built-in definitions of exactly this):
+
+```toml
+[[tokens.jsonl]]
+name = "mytool"                      # row label; "claude" or "pi" replaces a built-in
+dir = "~/.mytool/sessions"           # searched recursively
+ext = "jsonl"                        # default
+when = { type = "message", "message.role" = "assistant" }  # lines that count
+id = "message.responseId"            # dedup key (a list is joined); omit to count every line
+time = "timestamp"                   # RFC 3339, or Unix seconds / milliseconds
+input = "message.usage.input"        # a dotted path, or a list of paths to sum
+output = "message.usage.output"      # should already include reasoning
+cache_read = "message.usage.cacheRead"
+cache_write = "message.usage.cacheWrite"
+```
+
+A line counts when it matches `when` and has at least one of the usage fields.
+Unknown keys are an error, so typos don't silently count nothing.
 
 Only the first scan ever reads the whole history. The scanner's state is cached
 in `~/.cache/rdr/tokens.json`, so every later run (and every refresh of
