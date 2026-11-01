@@ -248,11 +248,18 @@ layout = "single"
 tracked = false
 "#;
 
-/// A copy of `sleep` named `claude`, so /proc/<pid>/comm looks like an agent.
-fn fake_agent(dir: &Path) -> PathBuf {
-    let p = dir.join("claude");
-    std::fs::copy("/bin/sleep", &p).unwrap();
-    p
+/// Command line for a process that rdreh sees as `claude` (its
+/// /proc/<pid>/comm) but that really runs `sleep secs`. The symlink sets the
+/// process name; `exec -a sleep` keeps argv[0] = "sleep", so multi-call
+/// coreutils (which dispatch on argv[0]) still behave as sleep.
+fn fake_agent_cmd(dir: &Path, secs: u32) -> String {
+    let link = dir.join("claude");
+    if !link.exists() {
+        let out = Command::new("sh").args(["-c", "command -v sleep"]).output().unwrap();
+        let sleep = std::fs::canonicalize(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
+        std::os::unix::fs::symlink(sleep, &link).unwrap();
+    }
+    format!("bash -c 'exec -a sleep {} {secs}'\r", link.display())
 }
 
 #[test]
@@ -278,8 +285,7 @@ fn panes_run_commands_and_receive_typed_input() {
 #[test]
 fn state_hook_drives_finished_counts_and_title() {
     let mut h = Harness::start("hook", BASIC);
-    let agent = fake_agent(h.path());
-    h.send(format!("{} 300\r", agent.display()).as_bytes());
+    h.send(fake_agent_cmd(h.path(), 3011).as_bytes());
     h.wait_until("agent detected", |h| h.rdr_ok(&["counts"]) == "1 0 1");
 
     let id = h.pane_ids("agents")[0].to_string();
@@ -418,8 +424,7 @@ panes = [ { cmd = "sleep 0.5", hold = false } ]
 #[test]
 fn kill_shuts_down_cleanly() {
     let mut h = Harness::start("kill", BASIC);
-    let agent = fake_agent(h.path());
-    h.send(format!("{} 300\r", agent.display()).as_bytes());
+    h.send(fake_agent_cmd(h.path(), 3017).as_bytes());
     h.wait_until("agent running", |h| h.rdr_ok(&["counts"]) == "1 0 1");
     let pid = h.workspace("agents")["panes"][0]["pid"].as_u64().unwrap();
 
@@ -431,7 +436,8 @@ fn kill_shuts_down_cleanly() {
     }
     assert!(h.exited(), "rdr did not exit");
     assert!(!Path::new(&format!("/proc/{pid}")).exists(), "pane shell survived");
-    let survivors = Command::new("pgrep").arg("-f").arg(agent.display().to_string()).output().unwrap();
+    // The agent's command line is exactly "sleep 3017" (argv[0] set by exec -a).
+    let survivors = Command::new("pgrep").args(["-fx", "sleep 3017"]).output().unwrap();
     assert!(survivors.stdout.is_empty(), "agent process survived shutdown");
 }
 
