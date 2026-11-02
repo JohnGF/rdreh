@@ -5,6 +5,9 @@ edition = "2024"
 description = "rdreh (command: rdr): keyboard-first terminal multiplexer for running and tracking AI coding agents"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/JohnGF/rdreh"
+homepage = "https://johngf.github.io/rdreh/"
+exclude = ["docs/", ".github/", "TODO.md", "CLAUDE.md"]
 keywords = ["terminal", "multiplexer", "tui", "agents", "pty"]
 categories = ["command-line-utilities"]
 
