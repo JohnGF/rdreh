@@ -9,6 +9,8 @@ It is a keyboard-first terminal multiplexer for running and tracking AI coding a
 (Claude Code, OpenCode, Gemini/agy, aider, ...). It is a single Rust binary:
 PTY supervisor, vt100 emulation, a ratatui UI and a Unix-socket IPC server.
 
+![Two Claude Code agents working side by side in rdreh, then both finishing](docs/assets/demo.gif)
+
 rdreh began as a rewrite of `agent-swarm`, a tmux + bash setup, and is now its
 own project. agent-swarm continues separately for people who prefer tmux. The
 two share the agent hook (`swarm-agent-state`), but nothing else.
