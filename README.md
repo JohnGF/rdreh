@@ -25,7 +25,7 @@ Website: https://johngf.github.io/rdreh/
 ## Install
 
 ```sh
-cargo install --git https://github.com/JohnGF/rdreh   # installs the `rdr` command (or: cargo install --path .)
+cargo install rdreh           # installs the `rdr` command (or: cargo install --path .)
 rdr install                   # desktop entry + icon: KRunner, app menu, taskbar
 rdr completions fish > ~/.config/fish/completions/rdr.fish   # also bash, zsh, elvish, powershell
 ```

@@ -28,11 +28,9 @@ Crate `rdreh`, command `rdr` ("herdr" backwards). A keyboard-first terminal mult
 
 ## Releasing
 
-Bump `version` in `Cargo.toml` and commit. Wait for CI to pass, then `git tag vX.Y.Z && git push --tags`. Not published to crates.io yet; that needs the owner's login.
+Bump `version` in `Cargo.toml` and commit. Wait for CI to pass, then `git tag vX.Y.Z && git push --tags`, create the GitHub release, and `cargo publish` (published on crates.io as `rdreh` since 2.1.0; the owner runs the publish).
 
 ## Open work
 
 - See `TODO.md`: native Windows (PowerShell/ConPTY) port, macOS support, and checks on non-KDE desktops.
-- A GitHub Pages site under `docs/` was handed to Jules, session `17706326242193196556`.
-  - Review it before merging. It should add only `docs/`, with image slots at `docs/assets/screens/*.png`, and no Rust, test or CI changes.
-  - After merging, turn on Pages in the repo settings: master, `/docs`.
+- The GitHub Pages site (`docs/`, served from master `/docs` at https://johngf.github.io/rdreh/) is live. Its screenshots are 1600×1000 and rendered offscreen from a tmux-hosted demo session; `docs/assets/screens/README.md` says how. Re-shoot them when the UI changes.
