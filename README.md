@@ -180,7 +180,7 @@ version-number process title (`2.1.x`) also counts. Shell panes never count.
 | Alt+0..9 | jump to workspace |
 | Shift+Arrows | move between panes; Left/Right at the edge wrap workspaces |
 | Alt+\` | cycle panes |
-| Alt+l | cycle layout: single, dual, tri, quad |
+| Alt+l | cycle layout: single, dual, tri, quad, rows, cockpit |
 | Alt+z | zoom the focused pane |
 | Alt+v | copy / view mode (scroll, visual select, yank to clipboard) |
 | Alt+= or Alt+r | reset the layout (unzoom) |

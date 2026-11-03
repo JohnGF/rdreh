@@ -46,13 +46,15 @@ impl Layout {
         }
     }
 
-    /// The Alt+l cycle: Single -> Dual -> Tri -> Quad -> Single.
+    /// The Alt+l cycle: Single -> Dual -> Tri -> Quad -> Rows -> Cockpit -> Single.
     pub fn next(self) -> Layout {
         match self {
             Layout::Single => Layout::Dual,
             Layout::Dual => Layout::Tri,
             Layout::Tri => Layout::Quad,
-            _ => Layout::Single,
+            Layout::Quad => Layout::Rows,
+            Layout::Rows => Layout::Cockpit,
+            Layout::Cockpit => Layout::Single,
         }
     }
 
@@ -301,7 +303,10 @@ mod tests {
     #[test]
     fn cycle_order() {
         let mut l = Layout::Single;
-        let seen: Vec<_> = (0..4).map(|_| { l = l.next(); l }).collect();
-        assert_eq!(seen, [Layout::Dual, Layout::Tri, Layout::Quad, Layout::Single]);
+        let seen: Vec<_> = (0..6).map(|_| { l = l.next(); l }).collect();
+        assert_eq!(
+            seen,
+            [Layout::Dual, Layout::Tri, Layout::Quad, Layout::Rows, Layout::Cockpit, Layout::Single]
+        );
     }
 }

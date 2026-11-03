@@ -19,7 +19,7 @@ pub const HELP: &str = "\
    Alt+0..9          jump to workspace
    Shift+Arrows      move between panes (left/right wrap workspaces)
    Alt+`             cycle panes
-   Alt+l             cycle layout: single > dual > tri > quad
+   Alt+l             cycle layout: single > dual > tri > quad > rows > cockpit
    Alt+z             zoom focused pane
    Alt+v             copy / view mode (scroll, select, yank)
    Alt+= / Alt+r     reset layout (unzoom)

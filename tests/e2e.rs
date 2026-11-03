@@ -327,7 +327,9 @@ fn state_hook_outside_rdr_is_rejected() {
 #[test]
 fn keyboard_drives_layout_focus_zoom_and_workspaces() {
     let mut h = Harness::start("keys", BASIC);
-    h.send(b"\x1bl"); // Alt+l: quad -> single
+    h.send(b"\x1bl"); // Alt+l: quad -> rows
+    h.send(b"\x1bl"); // cockpit
+    h.send(b"\x1bl"); // single
     assert_eq!(h.active()["layout"], "single");
     h.send(b"\x1bl"); // single -> dual
     assert_eq!(h.active()["layout"], "dual");
@@ -789,7 +791,9 @@ fn cycling_back_to_single_closes_unused_filler_panes_only() {
     h.wait_screen("keep-me");
     h.send(b"\x1b[1;2D"); // back to the original pane
 
-    h.send(b"\x1bl"); // quad -> single
+    h.send(b"\x1bl"); // quad -> rows
+    h.send(b"\x1bl"); // cockpit: +1 filler, left unused
+    h.send(b"\x1bl"); // single
     h.wait_until("single", |h| h.active()["layout"] == "single");
     let ids = h.pane_ids("editor");
     assert_eq!(ids.len(), 2, "unused fillers closed, used one kept: {ids:?}");
@@ -798,7 +802,9 @@ fn cycling_back_to_single_closes_unused_filler_panes_only() {
 
     // Configured panes are never closed by cycling.
     h.send(b"\x1b1");
-    h.send(b"\x1bl"); // agents quad -> single
+    h.send(b"\x1bl"); // agents quad -> rows
+    h.send(b"\x1bl"); // cockpit
+    h.send(b"\x1bl"); // single
     h.wait_until("agents single", |h| h.active()["layout"] == "single");
     assert_eq!(h.pane_ids("agents").len(), 4);
     h.wait_screen("single 1/4");
@@ -826,7 +832,10 @@ fn detach_keeps_everything_and_reattach_restores_it() {
     let mut h = Harness::start("persist", BASIC);
     h.send(b"echo persist-$((6*7))\r");
     h.wait_screen("persist-42");
-    h.send(b"\x1bl"); // agents quad -> single: layout state must survive too
+    // agents quad -> rows -> cockpit -> single: layout state must survive too
+    h.send(b"\x1bl");
+    h.send(b"\x1bl");
+    h.send(b"\x1bl");
     h.wait_until("single", |h| h.active()["layout"] == "single");
     let panes_before = h.pane_ids("agents");
 
