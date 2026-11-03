@@ -70,6 +70,50 @@ impl vt100::Callbacks for TermCallbacks {
 
 pub type Parser = vt100::Parser<TermCallbacks>;
 
+/// Rewrites the SCO save/restore cursor sequences (`CSI s`, `CSI u`), which
+/// vt100 ignores, into DECSC/DECRC (`ESC 7`, `ESC 8`), as xterm does.
+/// OpenCode saves the cursor, probes at the home position, restores, then
+/// enters the alternate screen; without this the restore was lost and the
+/// shell prompt came back at the top of the pane, over old output.
+#[derive(Default)]
+struct ScoCursorFilter {
+    /// A trailing `ESC` or `ESC [` held back until the next read.
+    carry: Vec<u8>,
+}
+
+impl ScoCursorFilter {
+    fn filter(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut data = std::mem::take(&mut self.carry);
+        data.extend_from_slice(input);
+        let mut out = Vec::with_capacity(data.len());
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] == 0x1b {
+                match (data.get(i + 1), data.get(i + 2)) {
+                    (Some(b'['), Some(b's')) => {
+                        out.extend_from_slice(b"\x1b7");
+                        i += 3;
+                        continue;
+                    }
+                    (Some(b'['), Some(b'u')) => {
+                        out.extend_from_slice(b"\x1b8");
+                        i += 3;
+                        continue;
+                    }
+                    (None, _) | (Some(b'['), None) => {
+                        self.carry = data[i..].to_vec();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(data[i]);
+            i += 1;
+        }
+        out
+    }
+}
+
 /// Interactive shells whose line editor clears the screen on Ctrl+L.
 const CLEARS_ON_CTRL_L: &[&str] = &["bash", "zsh", "fish", "nu", "elvish", "xonsh"];
 
@@ -207,6 +251,7 @@ impl Pane {
                 .name(format!("pane-{id}"))
                 .spawn(move || {
                     let mut buf = vec![0u8; 64 * 1024];
+                    let mut sco = ScoCursorFilter::default();
                     loop {
                         match reader.read(&mut buf) {
                             Ok(0) | Err(_) => break,
@@ -215,7 +260,7 @@ impl Pane {
                                 last_output.store(ms, Ordering::Release);
                                 let replies = {
                                     let mut p = parser.lock().unwrap();
-                                    p.process(&buf[..n]);
+                                    p.process(&sco.filter(&buf[..n]));
                                     std::mem::take(&mut p.callbacks_mut().responses)
                                 };
                                 if !replies.is_empty() {
@@ -422,6 +467,20 @@ mod tests {
         assert_eq!(r, "\x1b[1;6R\x1b[?62;22c");
         p.process(b"\x1b]2;my title\x07");
         assert_eq!(p.callbacks().title.as_deref(), Some("my title"));
+    }
+
+    #[test]
+    fn sco_save_restore_survives_alt_screen() {
+        // OpenCode's startup/exit, fed one byte at a time to cover split reads.
+        let stream: &[u8] = b"$ opencode\r\n\x1b[s\x1b[H\x1b[6n\x1b[u\x1b[s\x1b[?1049h\x1b[Hjunk\x1b[?1049l$ ";
+        let mut p = Parser::new_with_callbacks(nz(24), nz(80), 0, TermCallbacks::default());
+        let mut f = ScoCursorFilter::default();
+        for b in stream {
+            p.process(&f.filter(std::slice::from_ref(b)));
+        }
+        assert_eq!(p.screen().cursor_position(), (1, 2));
+        // Kitty keyboard queries (`CSI ? u`) pass through untouched.
+        assert_eq!(f.filter(b"\x1b[?u\x1b[>1u"), b"\x1b[?u\x1b[>1u");
     }
 
     #[test]
