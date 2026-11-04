@@ -612,7 +612,10 @@ impl App {
                     continue;
                 }
                 c.total += 1;
-                if self.panes.get(id).is_some_and(|p| p.agent_state == AgentState::Working) {
+                if self.panes.get(id).is_some_and(|p| {
+                    p.agent_state == AgentState::Working
+                        || (p.agent_state == AgentState::Unknown && p.recently_active(Duration::from_secs(2)))
+                }) {
                     c.busy += 1;
                 } else {
                     c.finished += 1;

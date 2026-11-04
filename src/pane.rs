@@ -146,6 +146,8 @@ pub struct Pane {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Set on the first user input; stops the startup clear.
     typed: Arc<AtomicBool>,
+    spawned: Instant,
+    last_output: Arc<AtomicU64>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     size: (u16, u16),
@@ -285,6 +287,8 @@ impl Pane {
             parser,
             writer,
             typed,
+            spawned,
+            last_output,
             master: pair.master,
             child,
             size: (rows, cols),
@@ -292,6 +296,12 @@ impl Pane {
             unseen_finish: false,
             auto: false,
         })
+    }
+
+    /// Produced output within the last `window` (for agents that report no state).
+    pub fn recently_active(&self, window: Duration) -> bool {
+        let last = self.last_output.load(Ordering::Acquire);
+        last > 0 && (self.spawned.elapsed().as_millis() as u64) < last + window.as_millis() as u64
     }
 
     /// Nothing was ever typed, pasted or clicked into this pane.
