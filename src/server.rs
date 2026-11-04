@@ -167,8 +167,16 @@ impl Client {
             use std::io::Write;
             let _ = backend.buf().write_all(&payload);
         }
-        let bytes = backend.take();
-        bytes.is_empty() || self.out.send(bytes).is_ok()
+        let mut bytes = backend.take();
+        if bytes.is_empty() {
+            return true;
+        }
+        // Synchronized output: the outer terminal applies the whole frame
+        // at once, so large redraws (long input boxes scrolling/wrapping)
+        // never show half-painted. Unsupporting terminals ignore it.
+        bytes.splice(0..0, b"\x1b[?2026h".iter().copied());
+        bytes.extend_from_slice(b"\x1b[?2026l");
+        self.out.send(bytes).is_ok()
     }
 
     fn close(self, mark: &[u8]) {

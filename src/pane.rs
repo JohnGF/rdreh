@@ -114,6 +114,17 @@ impl ScoCursorFilter {
     }
 }
 
+/// Last synchronized-output toggle (`CSI ?2026 h/l`) in a chunk, if any.
+fn sync_update_state(chunk: &[u8]) -> Option<bool> {
+    let find = |pat: &[u8]| chunk.windows(pat.len()).rposition(|w| w == pat);
+    match (find(b"\x1b[?2026h"), find(b"\x1b[?2026l")) {
+        (Some(h), Some(l)) => Some(h > l),
+        (Some(_), None) => Some(true),
+        (None, Some(_)) => Some(false),
+        (None, None) => None,
+    }
+}
+
 /// Interactive shells whose line editor clears the screen on Ctrl+L.
 const CLEARS_ON_CTRL_L: &[&str] = &["bash", "zsh", "fish", "nu", "elvish", "xonsh"];
 
@@ -254,6 +265,7 @@ impl Pane {
                 .spawn(move || {
                     let mut buf = vec![0u8; 64 * 1024];
                     let mut sco = ScoCursorFilter::default();
+                    let mut in_sync = false;
                     loop {
                         match reader.read(&mut buf) {
                             Ok(0) | Err(_) => break,
@@ -269,6 +281,16 @@ impl Pane {
                                     let mut w = writer.lock().unwrap();
                                     let _ = w.write_all(&replies);
                                     let _ = w.flush();
+                                }
+                                // Honour the app's synchronized-output bracket
+                                // (CSI ?2026h .. l): skip redraws mid-frame so a
+                                // half-written frame is never shown. The 1s tick
+                                // repaints as a fallback if `l` never arrives.
+                                if let Some(on) = sync_update_state(&buf[..n]) {
+                                    in_sync = on;
+                                }
+                                if in_sync {
+                                    continue;
                                 }
                                 // Coalesce redraw requests: one in flight at a time.
                                 if !dirty.swap(true, Ordering::AcqRel) {
