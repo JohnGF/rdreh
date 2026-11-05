@@ -983,3 +983,48 @@ fn copy_mode_navigation_selection_and_yank() {
     h.send(b"q");
     h.wait_until("exit copy mode", |h| !h.screen_text().contains("[COPY"));
 }
+
+/// A harness that brackets its frames in synchronized output, with a pause
+/// mid-frame. Keystrokes used to force a redraw there, showing half a frame.
+const SYNC_HARNESS: &str = "#!/bin/sh\nstty -echo\nwhile :; do\n  \
+    printf '\\033[?2026h\\033[2J\\033[HSYNCTOP\\r\\n'\n  sleep 0.05\n  \
+    printf 'SYNCBOT\\033[?2026l'\n  sleep 0.02\ndone\n";
+
+#[test]
+fn typing_never_shows_a_half_drawn_synchronized_frame() {
+    let mut h = Harness::start_with(
+        "e2e-sync",
+        "[workspaces.1]\nname = \"agents\"\nlayout = \"single\"\ncmd = \"{dir}/harness.sh\"\n",
+        &[("harness.sh", SYNC_HARNESS)],
+        &[],
+    );
+    h.wait_screen("SYNCBOT");
+
+    let (mut half, mut whole) = (0, 0);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        h.writer.write_all(b"x").unwrap();
+        h.writer.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(7));
+        let text = h.screen_text();
+        match (text.contains("SYNCTOP"), text.contains("SYNCBOT")) {
+            (true, false) => half += 1,
+            (true, true) => whole += 1,
+            _ => {}
+        }
+    }
+    assert!(whole > 0, "the harness never drew a whole frame\n{}", h.screen_text());
+    assert_eq!(half, 0, "{half} half-drawn samples against {whole} whole ones");
+}
+
+/// A harness that dies mid-frame must not freeze the pane.
+#[test]
+fn an_unterminated_synchronized_frame_does_not_freeze_the_pane() {
+    let h = Harness::start_with(
+        "e2e-sync-stuck",
+        "[workspaces.1]\nname = \"agents\"\nlayout = \"single\"\ncmd = \"{dir}/harness.sh\"\n",
+        &[("harness.sh", "#!/bin/sh\nprintf '\\033[?2026hSTUCKA'\nsleep 0.3\nprintf ' STUCKB'\nsleep 60\n")],
+        &[],
+    );
+    h.wait_screen("STUCKB");
+}

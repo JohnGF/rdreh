@@ -22,6 +22,7 @@ use crate::config::Config;
 use crate::desktop::Desktop;
 use crate::ipc;
 use crate::layout::Layout;
+use crate::pane::SYNC_MAX_DEFER;
 use crate::ui;
 
 /// Written just before the server closes a client's stream, so the client
@@ -207,9 +208,16 @@ pub async fn run(cfg: Config, session: String, args: ServerArgs) -> Result<()> {
     let frame_budget = Duration::from_millis(8);
     let mut last_draw = Instant::now() - frame_budget;
     let mut needs_draw = false;
+    let mut deferring_since: Option<Instant> = None;
 
     loop {
-        if needs_draw && last_draw.elapsed() >= frame_budget {
+        // Every redraw waits for a visible pane to finish its synchronized
+        // frame, whatever asked for it (a keypress, the tick), but not forever.
+        let deferred = needs_draw && app.visible_mid_frame() && {
+            deferring_since.get_or_insert_with(Instant::now).elapsed() < SYNC_MAX_DEFER
+        };
+        if needs_draw && !deferred && last_draw.elapsed() >= frame_budget {
+            deferring_since = None;
             app.dirty.store(false, Ordering::Release);
             if let Some(c) = client.as_mut()
                 && !c.draw(&mut app)
@@ -220,7 +228,11 @@ pub async fn run(cfg: Config, session: String, args: ServerArgs) -> Result<()> {
             needs_draw = false;
         }
 
-        let wait = frame_budget.saturating_sub(last_draw.elapsed());
+        let wait = if deferred {
+            Duration::from_millis(2) // Poll: the frame may close without a new event.
+        } else {
+            frame_budget.saturating_sub(last_draw.elapsed())
+        };
         tokio::select! {
             Some(ev) = rx.recv() => {
                 handle(&mut app, &mut client, ev);

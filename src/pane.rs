@@ -39,10 +39,16 @@ impl vt100::Callbacks for TermCallbacks {
         &mut self,
         screen: &mut vt100::Screen,
         i1: Option<u8>,
-        _i2: Option<u8>,
+        i2: Option<u8>,
         params: &[&[u16]],
         c: char,
     ) {
+        // DECRQM: harnesses only bracket their frames in synchronized output
+        // once the terminal says it knows the mode (2 = supported, now off).
+        if (i1, i2, c, first_param(params)) == (Some(b'?'), Some(b'$'), 'p', 2026) {
+            self.responses.extend_from_slice(b"\x1b[?2026;2$y");
+            return;
+        }
         let (row, col) = screen.cursor_position();
         let reply = match (i1, c, first_param(params)) {
             (None, 'c', 0) => "\x1b[?62;22c".to_string(),
@@ -114,14 +120,35 @@ impl ScoCursorFilter {
     }
 }
 
-/// Last synchronized-output toggle (`CSI ?2026 h/l`) in a chunk, if any.
-fn sync_update_state(chunk: &[u8]) -> Option<bool> {
-    let find = |pat: &[u8]| chunk.windows(pat.len()).rposition(|w| w == pat);
-    match (find(b"\x1b[?2026h"), find(b"\x1b[?2026l")) {
-        (Some(h), Some(l)) => Some(h > l),
-        (Some(_), None) => Some(true),
-        (None, Some(_)) => Some(false),
-        (None, None) => None,
+/// How long a frame may stay open before redraws stop waiting for it, in case
+/// the app died mid-frame and `CSI ?2026 l` never comes.
+pub const SYNC_MAX_DEFER: Duration = Duration::from_millis(100);
+
+/// Follows the synchronized-output bracket (`CSI ?2026 h/l`) across reads.
+#[derive(Default)]
+struct SyncTracker {
+    /// End of the last read: a toggle split across two reads still matches.
+    /// Shorter than a toggle, so it can never match twice.
+    tail: Vec<u8>,
+    in_sync: bool,
+}
+
+impl SyncTracker {
+    const OPEN: &[u8] = b"\x1b[?2026h";
+    const CLOSE: &[u8] = b"\x1b[?2026l";
+
+    fn feed(&mut self, chunk: &[u8]) -> bool {
+        let mut data = std::mem::take(&mut self.tail);
+        data.extend_from_slice(chunk);
+        let last = |pat: &[u8]| data.windows(pat.len()).rposition(|w| w == pat);
+        match (last(Self::OPEN), last(Self::CLOSE)) {
+            (Some(h), Some(l)) => self.in_sync = h > l,
+            (Some(_), None) => self.in_sync = true,
+            (None, Some(_)) => self.in_sync = false,
+            (None, None) => {}
+        }
+        self.tail = data[data.len().saturating_sub(Self::OPEN.len() - 1)..].to_vec();
+        self.in_sync
     }
 }
 
@@ -159,6 +186,8 @@ pub struct Pane {
     typed: Arc<AtomicBool>,
     spawned: Instant,
     last_output: Arc<AtomicU64>,
+    /// The app is between `CSI ?2026 h` and `l`: the screen holds half a frame.
+    mid_frame: Arc<AtomicBool>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     size: (u16, u16),
@@ -219,6 +248,7 @@ impl Pane {
         let spawned = Instant::now();
         // Milliseconds after spawn of the latest output (0 = none yet).
         let last_output = Arc::new(AtomicU64::new(0));
+        let mid_frame = Arc::new(AtomicBool::new(false));
 
         if spec.clear_on_start {
             let shell_pid = child.process_id();
@@ -260,18 +290,33 @@ impl Pane {
             let parser = parser.clone();
             let writer = writer.clone();
             let last_output = last_output.clone();
+            let mid_frame = mid_frame.clone();
             std::thread::Builder::new()
                 .name(format!("pane-{id}"))
                 .spawn(move || {
                     let mut buf = vec![0u8; 64 * 1024];
                     let mut sco = ScoCursorFilter::default();
-                    let mut in_sync = false;
+                    let mut sync = SyncTracker::default();
+                    let mut frame_start = Instant::now();
                     loop {
                         match reader.read(&mut buf) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 let ms = spawned.elapsed().as_millis().max(1) as u64;
                                 last_output.store(ms, Ordering::Release);
+                                let was_in_sync = sync.in_sync;
+                                let in_sync = sync.feed(&buf[..n]);
+                                if in_sync && !was_in_sync {
+                                    frame_start = Instant::now();
+                                }
+                                // Give up on a frame that never closes.
+                                let in_sync = in_sync && frame_start.elapsed() < SYNC_MAX_DEFER;
+                                sync.in_sync = in_sync;
+                                // Raised before the parser sees the frame and
+                                // lowered after, to keep draws out of it.
+                                if in_sync {
+                                    mid_frame.store(true, Ordering::Release);
+                                }
                                 let replies = {
                                     let mut p = parser.lock().unwrap();
                                     p.process(&sco.filter(&buf[..n]));
@@ -282,16 +327,10 @@ impl Pane {
                                     let _ = w.write_all(&replies);
                                     let _ = w.flush();
                                 }
-                                // Honour the app's synchronized-output bracket
-                                // (CSI ?2026h .. l): skip redraws mid-frame so a
-                                // half-written frame is never shown. The 1s tick
-                                // repaints as a fallback if `l` never arrives.
-                                if let Some(on) = sync_update_state(&buf[..n]) {
-                                    in_sync = on;
-                                }
                                 if in_sync {
-                                    continue;
+                                    continue; // The closing `l` asks for the redraw.
                                 }
+                                mid_frame.store(false, Ordering::Release);
                                 // Coalesce redraw requests: one in flight at a time.
                                 if !dirty.swap(true, Ordering::AcqRel) {
                                     let _ = events.send(Event::Redraw);
@@ -311,6 +350,7 @@ impl Pane {
             typed,
             spawned,
             last_output,
+            mid_frame,
             master: pair.master,
             child,
             size: (rows, cols),
@@ -324,6 +364,11 @@ impl Pane {
     pub fn recently_active(&self, window: Duration) -> bool {
         let last = self.last_output.load(Ordering::Acquire);
         last > 0 && (self.spawned.elapsed().as_millis() as u64) < last + window.as_millis() as u64
+    }
+
+    /// Mid-way through a synchronized frame: drawing now would show half of it.
+    pub fn mid_frame(&self) -> bool {
+        self.mid_frame.load(Ordering::Acquire)
     }
 
     /// Nothing was ever typed, pasted or clicked into this pane.
@@ -499,6 +544,28 @@ mod tests {
         assert_eq!(r, "\x1b[1;6R\x1b[?62;22c");
         p.process(b"\x1b]2;my title\x07");
         assert_eq!(p.callbacks().title.as_deref(), Some("my title"));
+    }
+
+    #[test]
+    fn reports_synchronized_output_support() {
+        let mut p = Parser::new_with_callbacks(nz(24), nz(80), 0, TermCallbacks::default());
+        p.process(b"\x1b[?2026$p\x1b[?2027$p");
+        assert_eq!(p.callbacks().responses, b"\x1b[?2026;2$y");
+    }
+
+    #[test]
+    fn sync_tracker_follows_toggles_split_across_reads() {
+        let mut t = SyncTracker::default();
+        let feed_bytes = |t: &mut SyncTracker, s: &[u8]| {
+            s.iter().map(|b| t.feed(std::slice::from_ref(b))).last().unwrap()
+        };
+        assert!(feed_bytes(&mut t, b"x\x1b[?2026h"));
+        assert!(t.feed(b"half a frame"));
+        assert!(!feed_bytes(&mut t, b"\x1b[?2026l"));
+        // The last toggle in a read wins: this one ends inside the next frame.
+        assert!(t.feed(b"\x1b[?2026h1\x1b[?2026l\x1b[?2026h2"));
+        assert!(!t.feed(b"\x1b[?2026l\x1b[?2026h3\x1b[?2026l"));
+        assert!(!t.feed(b"plain output"));
     }
 
     #[test]

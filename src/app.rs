@@ -307,6 +307,13 @@ impl App {
         }
     }
 
+    /// A pane on screen is mid-way through a synchronized frame.
+    pub fn visible_mid_frame(&self) -> bool {
+        self.ws().is_some_and(|ws| {
+            self.visible_panes(ws).iter().any(|(id, _)| self.panes.get(id).is_some_and(|p| p.mid_frame()))
+        })
+    }
+
     pub fn relayout(&mut self) {
         let mut sizes = Vec::new();
         for ws in &self.workspaces {
