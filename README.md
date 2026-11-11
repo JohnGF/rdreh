@@ -188,6 +188,7 @@ version-number process title (`2.1.x`) also counts. Shell panes never count.
 | Shift+PgUp/PgDn, mouse wheel | scrollback |
 | Shift+Enter | sends Meta+Enter (newline in agent prompts) |
 | Mouse drag | select and copy text to clipboard inside pane |
+| Ctrl+click | open the URL or file under the mouse with `xdg-open`. Relative paths resolve against the pane's working directory; `file.rs:12:3` suffixes are ignored |
 | Ctrl+Shift+V | terminal paste. Files copied in a file manager arrive as escaped paths on one line, not `file://` lines (Konsole, kitty, WezTerm) |
 | Ctrl+b h | help overlay |
 | Ctrl+b [ or v | enter copy / view mode |

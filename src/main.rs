@@ -8,6 +8,7 @@ mod ipc;
 mod keys;
 mod launcher;
 mod layout;
+mod links;
 mod pane;
 mod paste;
 mod procinfo;

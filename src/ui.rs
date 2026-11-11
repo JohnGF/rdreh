@@ -29,6 +29,7 @@ pub const HELP: &str = "\
    Shift+PgUp/PgDn   scrollback (any key returns to live)
    Shift+Enter       newline in agent prompts (sends Meta+Enter)
    Mouse             click to focus, drag to copy, wheel to scroll
+   Ctrl+click        open URL or file (relative to the pane's cwd)
 
  Ctrl+b, then
    h ?               this help          a   add project folder

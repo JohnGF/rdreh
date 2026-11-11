@@ -20,6 +20,7 @@ use crate::desktop::Desktop;
 use crate::ipc::{Request, Response};
 use crate::keys;
 use crate::layout::{self, Dir, Layout};
+use crate::links;
 use crate::pane::{AgentState, Pane, PaneId, SHELLS, SpawnSpec};
 use crate::procinfo;
 
@@ -115,6 +116,8 @@ pub struct App {
     pub tab_hits: Vec<(u8, Rect)>,
     pub pending_clipboard: Vec<Vec<u8>>,
     mouse_down_pos: Option<(PaneId, u16, u16)>,
+    /// A Ctrl+click opened a link: its button release is swallowed too.
+    link_click: bool,
     commands: HashMap<PaneId, String>,
     next_id: PaneId,
     term_size: (u16, u16),
@@ -163,6 +166,7 @@ impl App {
             tab_hits: Vec::new(),
             pending_clipboard: Vec::new(),
             mouse_down_pos: None,
+            link_click: false,
             commands: HashMap::new(),
             next_id: 1,
             term_size,
@@ -1084,7 +1088,39 @@ impl App {
         }
     }
 
+    /// Ctrl+click: opens the URL or file under (`col`, `row`) of pane `id`,
+    /// resolving relative paths against the pane's cwd. Returns false when
+    /// there is no word there, so the click is handled as usual.
+    fn open_link_at(&mut self, id: PaneId, col: u16, row: u16) -> bool {
+        let Some(p) = self.panes.get(&id) else { return false };
+        let tok = {
+            let parser = p.parser.lock().unwrap();
+            links::line_at(parser.screen(), row, col).and_then(|(line, idx)| links::token_at(&line, idx))
+        };
+        let Some(tok) = tok else { return false };
+        let cwd = p.cwd().or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+        match links::resolve(&tok, &cwd) {
+            Some(target) => match links::open(&target) {
+                Ok(()) => self.flash(format!("Opening {tok}")),
+                Err(e) => self.flash(format!("Could not open {tok}: {e}")),
+            },
+            None => self.flash(format!("Not a link or existing file: {tok}")),
+        }
+        true
+    }
+
     fn handle_mouse(&mut self, m: MouseEvent) {
+        if self.link_click {
+            match m.kind {
+                MouseEventKind::Drag(MouseButton::Left) => return,
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.link_click = false;
+                    return;
+                }
+                MouseEventKind::Down(_) => self.link_click = false,
+                _ => {}
+            }
+        }
         let pos = Position::new(m.column, m.row);
         let tab_hit = if let MouseEventKind::Down(MouseButton::Left) = m.kind {
             self.tab_hits.iter().find(|(_, r)| r.contains(pos)).map(|(idx, _)| *idx)
@@ -1113,6 +1149,15 @@ impl App {
         } else {
             (0, 0)
         };
+
+        if in_inner
+            && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && m.modifiers.contains(KeyModifiers::CONTROL)
+            && self.open_link_at(id, col, row)
+        {
+            self.link_click = true;
+            return;
+        }
 
         if let Mode::Copy(mut state) = self.mode.clone() {
             if state.pane_id == id && in_inner {
