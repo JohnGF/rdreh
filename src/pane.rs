@@ -76,47 +76,85 @@ impl vt100::Callbacks for TermCallbacks {
 
 pub type Parser = vt100::Parser<TermCallbacks>;
 
-/// Rewrites the SCO save/restore cursor sequences (`CSI s`, `CSI u`), which
-/// vt100 ignores, into DECSC/DECRC (`ESC 7`, `ESC 8`), as xterm does.
-/// OpenCode saves the cursor, probes at the home position, restores, then
-/// enters the alternate screen; without this the restore was lost and the
-/// shell prompt came back at the top of the pane, over old output.
+/// Feeds the parser, standing in for cursor sequences vt100 ignores:
+/// - SCO save/restore (`CSI s`, `CSI u`) become DECSC/DECRC (`ESC 7`, `ESC 8`),
+///   as xterm treats them. OpenCode saves the cursor, probes at the home
+///   position, restores, then enters the alternate screen; without this the
+///   restore was lost and the shell prompt came back at the top of the pane.
+/// - Tab moves (`CSI n I` forward, `CSI n Z` back) become an absolute column.
+///   agy moves left through its input line with backspaces plus `CSI n Z`, so
+///   an edit mid-line was drawn at the wrong column until the next full redraw.
 #[derive(Default)]
-struct ScoCursorFilter {
-    /// A trailing `ESC` or `ESC [` held back until the next read.
+struct CursorFixups {
+    /// An unfinished `ESC [ digits` held back until the next read.
     carry: Vec<u8>,
 }
 
-impl ScoCursorFilter {
-    fn filter(&mut self, input: &[u8]) -> Vec<u8> {
+/// vt100 keeps a tab stop every 8 columns.
+const TAB_WIDTH: u16 = 8;
+
+impl CursorFixups {
+    fn feed(&mut self, p: &mut Parser, input: &[u8]) {
         let mut data = std::mem::take(&mut self.carry);
         data.extend_from_slice(input);
         let mut out = Vec::with_capacity(data.len());
         let mut i = 0;
         while i < data.len() {
-            if data[i] == 0x1b {
-                match (data.get(i + 1), data.get(i + 2)) {
-                    (Some(b'['), Some(b's')) => {
-                        out.extend_from_slice(b"\x1b7");
-                        i += 3;
-                        continue;
-                    }
-                    (Some(b'['), Some(b'u')) => {
-                        out.extend_from_slice(b"\x1b8");
-                        i += 3;
-                        continue;
-                    }
-                    (None, _) | (Some(b'['), None) => {
-                        self.carry = data[i..].to_vec();
-                        break;
-                    }
-                    _ => {}
+            if data[i] != 0x1b {
+                out.push(data[i]);
+                i += 1;
+                continue;
+            }
+            match data.get(i + 1) {
+                None => {
+                    self.carry = data[i..].to_vec();
+                    break;
+                }
+                Some(b'[') => {}
+                Some(_) => {
+                    out.push(data[i]);
+                    i += 1;
+                    continue;
                 }
             }
-            out.push(data[i]);
-            i += 1;
+            let digits = data[i + 2..].iter().take_while(|b| b.is_ascii_digit()).count();
+            let end = i + 2 + digits;
+            let Some(&fin) = data.get(end) else {
+                // Long digit runs are not ours to wait for.
+                if digits < 6 {
+                    self.carry = data[i..].to_vec();
+                    break;
+                }
+                out.extend_from_slice(&data[i..]);
+                break;
+            };
+            let n: u16 = std::str::from_utf8(&data[i + 2..end])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+                .max(1);
+            match (fin, digits) {
+                (b's', 0) => out.extend_from_slice(b"\x1b7"),
+                (b'u', 0) => out.extend_from_slice(b"\x1b8"),
+                (b'I' | b'Z', _) => {
+                    p.process(&std::mem::take(&mut out));
+                    let screen = p.screen();
+                    let (_, col) = screen.cursor_position();
+                    let last = screen.size().1.get() - 1;
+                    let col = if fin == b'I' {
+                        (col / TAB_WIDTH).saturating_add(n).saturating_mul(TAB_WIDTH).min(last)
+                    } else {
+                        (col.saturating_sub(1) / TAB_WIDTH)
+                            .saturating_sub(n - 1)
+                            .saturating_mul(TAB_WIDTH)
+                    };
+                    out.extend_from_slice(format!("\x1b[{}G", col + 1).as_bytes());
+                }
+                _ => out.extend_from_slice(&data[i..=end]),
+            }
+            i = end + 1;
         }
-        out
+        p.process(&out);
     }
 }
 
@@ -295,7 +333,7 @@ impl Pane {
                 .name(format!("pane-{id}"))
                 .spawn(move || {
                     let mut buf = vec![0u8; 64 * 1024];
-                    let mut sco = ScoCursorFilter::default();
+                    let mut fixups = CursorFixups::default();
                     let mut sync = SyncTracker::default();
                     let mut frame_start = Instant::now();
                     loop {
@@ -319,7 +357,7 @@ impl Pane {
                                 }
                                 let replies = {
                                     let mut p = parser.lock().unwrap();
-                                    p.process(&sco.filter(&buf[..n]));
+                                    fixups.feed(&mut p, &buf[..n]);
                                     std::mem::take(&mut p.callbacks_mut().responses)
                                 };
                                 if !replies.is_empty() {
@@ -573,13 +611,39 @@ mod tests {
         // OpenCode's startup/exit, fed one byte at a time to cover split reads.
         let stream: &[u8] = b"$ opencode\r\n\x1b[s\x1b[H\x1b[6n\x1b[u\x1b[s\x1b[?1049h\x1b[Hjunk\x1b[?1049l$ ";
         let mut p = Parser::new_with_callbacks(nz(24), nz(80), 0, TermCallbacks::default());
-        let mut f = ScoCursorFilter::default();
+        let mut f = CursorFixups::default();
         for b in stream {
-            p.process(&f.filter(std::slice::from_ref(b)));
+            f.feed(&mut p, std::slice::from_ref(b));
         }
         assert_eq!(p.screen().cursor_position(), (1, 2));
-        // Kitty keyboard queries (`CSI ? u`) pass through untouched.
-        assert_eq!(f.filter(b"\x1b[?u\x1b[>1u"), b"\x1b[?u\x1b[>1u");
+        // Kitty keyboard flags (`CSI ? u`, `CSI > 1 u`) are not a restore.
+        f.feed(&mut p, b"\x1b[3;5H\x1b[?u\x1b[>1u");
+        assert_eq!(p.screen().cursor_position(), (2, 4));
+    }
+
+    #[test]
+    fn tab_moves_land_on_tab_stops() {
+        let mut p = Parser::new_with_callbacks(nz(24), nz(80), 0, TermCallbacks::default());
+        let mut f = CursorFixups::default();
+        let mut at = |p: &mut Parser, s: &[u8]| {
+            for b in s {
+                f.feed(p, std::slice::from_ref(b));
+            }
+            p.screen().cursor_position().1
+        };
+        assert_eq!(at(&mut p, b"\x1b[1;14H\x1b[Z"), 8);
+        assert_eq!(at(&mut p, b"\x1b[Z"), 0);
+        assert_eq!(at(&mut p, b"\x1b[Z"), 0);
+        assert_eq!(at(&mut p, b"\x1b[1;30H\x1b[2Z"), 16);
+        assert_eq!(at(&mut p, b"\x1b[I"), 24);
+        assert_eq!(at(&mut p, b"\x1b[3I"), 48);
+        assert_eq!(at(&mut p, b"\x1b[99I"), 79);
+        // agy moving 13 left from the end of its input line, then inserting.
+        let line = b"\r> the quick brown fox jumps over the lazy dog";
+        assert_eq!(at(&mut p, line), 45);
+        at(&mut p, b"\x08\x1b[2ZV the lazy dog\x1b[13D");
+        let row = p.screen().contents().lines().next().unwrap().trim_end().to_string();
+        assert_eq!(row, "> the quick brown fox jumps overV the lazy dog");
     }
 
     #[test]
